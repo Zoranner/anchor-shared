@@ -1,0 +1,17 @@
+[package]
+name = "anchor-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anchor Guard 核心类型、签名验证与审计 hash chain"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

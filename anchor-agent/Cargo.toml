@@ -1,0 +1,27 @@
+[package]
+name = "anchor-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anchor Guard 终端守护服务"
+
+[dependencies]
+anchor-core.workspace = true
+anchor-store.workspace = true
+anchor-scan.workspace = true
+anchor-platform.workspace = true
+notify.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

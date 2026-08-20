@@ -1,0 +1,17 @@
+[package]
+name = "anchor-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anchor Guard 终端本地 SQLite 存储"
+
+[dependencies]
+anchor-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
