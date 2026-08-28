@@ -1,0 +1,18 @@
+[package]
+name = "anchor-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anchor Guard 离线策略签发工具"
+
+[dependencies]
+anchor-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
