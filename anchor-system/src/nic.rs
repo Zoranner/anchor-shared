@@ -1,7 +1,6 @@
 //! 网卡控制适配。
 //!
-//! 后续接入点：Windows 使用网络适配器管理接口，Linux 使用 NetworkManager、
-//! systemd-networkd 或 iproute2；防火墙接口与企业终端管理策略配合执行。
+//! 后续接入点：Windows 使用网络适配器管理接口；防火墙接口与企业终端管理策略配合执行。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

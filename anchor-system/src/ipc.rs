@@ -1,6 +1,6 @@
 //! 本地通信适配。
 //!
-//! 后续接入点：Windows 使用 Named Pipe，Linux 使用 Unix domain socket。
+//! 后续接入点：Windows 使用 Named Pipe。
 //! 承载桌面程序到终端守护服务的本地调用；首迭代不启用，仅占位接口。
 
 use crate::error::PlatformError;

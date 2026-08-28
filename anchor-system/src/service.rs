@@ -1,6 +1,6 @@
 //! 终端守护服务自保护适配。
 //!
-//! 服务形态：Windows 使用 Windows Service，Linux 使用 systemd service。
+//! 服务形态：Windows 使用 Windows Service。
 //! 后续接入点：Windows Service 受控权限、程序目录权限保护、卸载授权校验，
 //! 防止普通方式停止服务、卸载程序或清除本地审计记录。
 
