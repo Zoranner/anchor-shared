@@ -13,7 +13,7 @@ use anchor_core::{
     verify_chain, AuditEvent, AuditPayload, EventType, ImportDecision, PolicyPackage, GENESIS_HASH,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 /// 本机 SQLite 存储。所有写入经由单个连接串行化，以维持审计链顺序。
 pub struct Store {
@@ -25,6 +25,14 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         Self::from_connection(connection)
+    }
+
+    /// 以只读方式打开既有审计库，不创建数据库或修改其中任何状态。
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
     }
 
     /// 用于测试和进程内临时存储的内存数据库。
@@ -250,12 +258,21 @@ impl Store {
         Ok(())
     }
 
-    /// 返回审计 hash chain 是否完整。空链可验证，数据库读取失败仍返回错误。
-    pub fn audit_chain_healthy(&self) -> Result<bool, StoreError> {
+    /// 按写入顺序读取全部审计事件，供只读导出与完整性校验使用。
+    pub fn read_audit_events(&self) -> Result<Vec<AuditEvent>, StoreError> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
+        Self::read_audit_events_in(&connection)
+    }
+
+    /// 返回审计 hash chain 是否完整。空链可验证，数据库读取失败仍返回错误。
+    pub fn audit_chain_healthy(&self) -> Result<bool, StoreError> {
+        Ok(verify_chain(&self.read_audit_events()?).is_ok())
+    }
+
+    fn read_audit_events_in(connection: &Connection) -> Result<Vec<AuditEvent>, StoreError> {
         let mut statement = connection.prepare(
             "SELECT event_id, device_id, user_name, timestamp, event_type, process, resource,
                     policy_version, action, result, rule_id, prev_hash, event_hash
@@ -315,7 +332,7 @@ impl Store {
                 event_hash,
             });
         }
-        Ok(verify_chain(&events).is_ok())
+        Ok(events)
     }
 
     fn append_audit_in(
@@ -523,5 +540,24 @@ mod tests {
 
         store.append_audit(payload).unwrap();
         assert!(store.audit_chain_healthy().unwrap());
+    }
+
+    #[test]
+    fn read_only_open_reads_existing_audit_without_creating_state() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(file.path()).unwrap();
+        let mut payload = AuditPayload::new(
+            "laptop-1",
+            "developer",
+            EventType::AuthorizationDenied,
+            "login",
+            "denied",
+        );
+        payload.timestamp = now();
+        store.append_audit(payload).unwrap();
+        drop(store);
+
+        let read_only = Store::open_read_only(file.path()).unwrap();
+        assert_eq!(read_only.read_audit_events().unwrap().len(), 1);
     }
 }
