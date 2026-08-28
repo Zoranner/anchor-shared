@@ -27,9 +27,9 @@ pub struct ImportOutcome {
 
 /// 本地授权的唯一组织者。
 pub struct Service {
-    store: Store,
+    pub(crate) store: Store,
     verifying_key: VerifyingKey,
-    device_id: String,
+    pub(crate) device_id: String,
 }
 
 impl Service {

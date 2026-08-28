@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use anchor_core::{
     crypto, ActionPolicy, BurningRules, NetworkRules, PolicyPackage, PolicyPayload, ScanRules,
-    UsbRules,
+    UsbAllowRule, UsbRules,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -64,6 +64,7 @@ impl PolicyConfig {
         if self.scan.controlled_dirs.is_empty() {
             bail!("scan.controlled_dirs 不能为空");
         }
+        validate_allowed_objects(&self.usb, &self.network, &self.burning)?;
         if !has_allow_rule(&self.usb, &self.network, &self.burning) {
             bail!("策略至少需要一条明确允许的受控设备规则");
         }
@@ -152,8 +153,61 @@ fn parse_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
 }
 
 fn has_allow_rule(usb: &UsbRules, network: &NetworkRules, burning: &BurningRules) -> bool {
-    matches!(usb.read, ActionPolicy::Allow)
-        || matches!(usb.write, ActionPolicy::Allow)
-        || matches!(network.policy, ActionPolicy::Allow)
-        || matches!(burning.policy, ActionPolicy::Allow)
+    (matches!(usb.read, ActionPolicy::Allow) || matches!(usb.write, ActionPolicy::Allow))
+        && !usb.allowed.is_empty()
+        || matches!(network.policy, ActionPolicy::Allow) && !network.allowed.is_empty()
+        || matches!(burning.policy, ActionPolicy::Allow) && !burning.allowed.is_empty()
+}
+
+fn validate_allowed_objects(
+    usb: &UsbRules,
+    network: &NetworkRules,
+    burning: &BurningRules,
+) -> Result<()> {
+    if (matches!(usb.read, ActionPolicy::Allow) || matches!(usb.write, ActionPolicy::Allow))
+        && usb.allowed.is_empty()
+    {
+        bail!("usb 允许读取或写入时 usb.allowed 不能为空");
+    }
+    if matches!(network.policy, ActionPolicy::Allow) && network.allowed.is_empty() {
+        bail!("network.policy 为 allow 时 network.allowed 不能为空");
+    }
+    if matches!(burning.policy, ActionPolicy::Allow) && burning.allowed.is_empty() {
+        bail!("burning.policy 为 allow 时 burning.allowed 不能为空");
+    }
+
+    for (index, rule) in usb.allowed.iter().enumerate() {
+        validate_usb_allow_rule(rule, index)?;
+    }
+    for (index, rule) in network.allowed.iter().enumerate() {
+        if rule.adapter_id.trim().is_empty() {
+            bail!("network.allowed[{index}].adapter_id 不能为空");
+        }
+    }
+    for (index, rule) in burning.allowed.iter().enumerate() {
+        if rule.drive_id.trim().is_empty() {
+            bail!("burning.allowed[{index}].drive_id 不能为空");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_usb_allow_rule(rule: &UsbAllowRule, index: usize) -> Result<()> {
+    let fields = [
+        ("instance_id", rule.instance_id.as_deref()),
+        ("vendor_id", rule.vendor_id.as_deref()),
+        ("product_id", rule.product_id.as_deref()),
+        ("serial", rule.serial.as_deref()),
+    ];
+    if fields.iter().all(|(_, value)| value.is_none()) {
+        bail!("usb.allowed[{index}] 至少需要 instance_id、vendor_id、product_id 或 serial 之一");
+    }
+    for (field, value) in fields {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            bail!("usb.allowed[{index}].{field} 不能为空白字符串");
+        }
+    }
+
+    Ok(())
 }

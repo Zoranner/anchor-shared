@@ -29,3 +29,4 @@ windows-service = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true

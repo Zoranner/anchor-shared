@@ -202,7 +202,7 @@ mod windows {
             wait: i32,
         ) -> i32;
         fn GetNamedPipeServerProcessId(named_pipe: isize, server_process_id: *mut u32) -> i32;
-        fn LocalFree(memory: isize) -> isize;
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn ReadFile(
             file: isize,
@@ -246,7 +246,7 @@ mod windows {
     impl Drop for SecurityDescriptor {
         fn drop(&mut self) {
             unsafe {
-                LocalFree(self.0 as isize);
+                LocalFree(self.0);
             }
         }
     }

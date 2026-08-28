@@ -246,6 +246,112 @@ impl Store {
         Ok(())
     }
 
+    /// 原子写入设备最近状态；同一设备类别和设备 ID 始终保留最新记录。
+    pub fn upsert_device_state(
+        &self,
+        kind: &str,
+        device_id: &str,
+        state: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Self::upsert_device_state_in(&connection, kind, device_id, state, now)
+    }
+
+    /// 在同一事务中先追加审计事件，再写入设备最近状态。
+    ///
+    /// 状态 JSON 在事务开始前序列化，序列化失败时不会产生审计副作用。
+    pub fn append_audit_and_upsert_device_state(
+        &self,
+        payload: AuditPayload,
+        kind: &str,
+        device_id: &str,
+        state: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let state_json = serde_json::to_string(state)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let transaction = connection.transaction()?;
+        Self::append_audit_in(&transaction, payload)?;
+        Self::upsert_device_state_json_in(&transaction, kind, device_id, &state_json, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn upsert_device_state_in(
+        connection: &Connection,
+        kind: &str,
+        device_id: &str,
+        state: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let state_json = serde_json::to_string(state)?;
+        Self::upsert_device_state_json_in(connection, kind, device_id, &state_json, now)
+    }
+
+    fn upsert_device_state_json_in(
+        connection: &Connection,
+        kind: &str,
+        device_id: &str,
+        state_json: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        connection.execute(
+            "INSERT INTO device_state (kind, device_id, state_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(kind, device_id) DO UPDATE SET
+               state_json = excluded.state_json,
+               updated_at = excluded.updated_at",
+            params![kind, device_id, state_json, now.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 读取指定设备最近一次保存的状态。
+    pub fn device_state(
+        &self,
+        kind: &str,
+        device_id: &str,
+    ) -> Result<Option<DeviceStateRecord>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let record = connection
+            .query_row(
+                "SELECT kind, device_id, state_json, updated_at
+                 FROM device_state WHERE kind = ?1 AND device_id = ?2",
+                params![kind, device_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        record
+            .map(|(kind, device_id, state_json, updated_at)| {
+                Ok(DeviceStateRecord {
+                    kind,
+                    device_id,
+                    state: serde_json::from_str(&state_json)?,
+                    updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                        .map_err(|_| StoreError::TimeParse(updated_at))?
+                        .with_timezone(&Utc),
+                })
+            })
+            .transpose()
+    }
+
     /// 原子追加一条本地审计事件，并与上一条事件的 hash 连接。
     pub fn append_audit(&self, payload: AuditPayload) -> Result<(), StoreError> {
         let mut connection = self
@@ -413,12 +519,15 @@ mod tests {
                 usb: UsbRules {
                     read: ActionPolicy::Deny,
                     write: ActionPolicy::Deny,
+                    allowed: vec![],
                 },
                 network: NetworkRules {
                     policy: ActionPolicy::Deny,
+                    allowed: vec![],
                 },
                 burning: BurningRules {
                     policy: ActionPolicy::Deny,
+                    allowed: vec![],
                 },
                 scan: ScanRules {
                     controlled_dirs: vec![],
@@ -559,5 +668,115 @@ mod tests {
 
         let read_only = Store::open_read_only(file.path()).unwrap();
         assert_eq!(read_only.read_audit_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_device_state_replaces_the_latest_state_for_the_same_device() {
+        let store = Store::in_memory().unwrap();
+        let first_updated_at = now();
+        let latest_updated_at = now() + Duration::minutes(5);
+
+        store
+            .upsert_device_state(
+                "usb",
+                "USB\\VID_1234&PID_5678",
+                &serde_json::json!({ "enabled": false }),
+                first_updated_at,
+            )
+            .unwrap();
+        store
+            .upsert_device_state(
+                "usb",
+                "USB\\VID_1234&PID_5678",
+                &serde_json::json!({ "enabled": true }),
+                latest_updated_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.device_state("usb", "USB\\VID_1234&PID_5678").unwrap(),
+            Some(DeviceStateRecord {
+                kind: "usb".into(),
+                device_id: "USB\\VID_1234&PID_5678".into(),
+                state: serde_json::json!({ "enabled": true }),
+                updated_at: latest_updated_at,
+            }),
+        );
+        assert_eq!(store.device_state("usb", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn append_audit_and_upsert_device_state_persists_both_records() {
+        let store = Store::in_memory().unwrap();
+        let mut payload = AuditPayload::new(
+            "laptop-1",
+            "service",
+            EventType::AuthorizationDenied,
+            "apply_policy",
+            "disabled",
+        );
+        payload.timestamp = now();
+
+        store
+            .append_audit_and_upsert_device_state(
+                payload,
+                "usb",
+                "USB\\VID_1234&PID_5678",
+                &serde_json::json!({ "enabled": false }),
+                now(),
+            )
+            .unwrap();
+
+        assert_eq!(store.read_audit_events().unwrap().len(), 1);
+        assert!(store.audit_chain_healthy().unwrap());
+        assert_eq!(
+            store
+                .device_state("usb", "USB\\VID_1234&PID_5678")
+                .unwrap()
+                .unwrap()
+                .state,
+            serde_json::json!({ "enabled": false }),
+        );
+    }
+
+    #[test]
+    fn failed_device_state_write_rolls_back_the_appended_audit_event() {
+        let store = Store::in_memory().unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_device_state_insert
+                 BEFORE INSERT ON device_state
+                 BEGIN
+                   SELECT RAISE(ABORT, 'device state rejected');
+                 END;",
+            )
+            .unwrap();
+        let mut payload = AuditPayload::new(
+            "laptop-1",
+            "service",
+            EventType::AuthorizationDenied,
+            "apply_policy",
+            "disabled",
+        );
+        payload.timestamp = now();
+
+        assert!(matches!(
+            store.append_audit_and_upsert_device_state(
+                payload,
+                "usb",
+                "USB\\VID_1234&PID_5678",
+                &serde_json::json!({ "enabled": false }),
+                now(),
+            ),
+            Err(StoreError::Db(_))
+        ));
+        assert!(store.read_audit_events().unwrap().is_empty());
+        assert_eq!(
+            store.device_state("usb", "USB\\VID_1234&PID_5678").unwrap(),
+            None,
+        );
     }
 }

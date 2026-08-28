@@ -17,6 +17,9 @@ clock_rollback_tolerance_secs = 300
 read = "allow"
 write = "deny"
 
+[[usb.allowed]]
+instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1"
+
 [network]
 policy = "deny"
 
@@ -123,6 +126,28 @@ fn sign_rejects_invalid_policy_configuration() {
         (
             "no-allow-rule",
             valid_config().replace("read = \"allow\"", "read = \"deny\""),
+        ),
+        (
+            "network-allow-without-object",
+            valid_config()
+                .replace("read = \"allow\"", "read = \"deny\"")
+                .replace("policy = \"deny\"", "policy = \"allow\""),
+        ),
+        (
+            "usb-allow-without-match-field",
+            format!("{}\n[[usb.allowed]]\n", valid_config()),
+        ),
+        (
+            "network-allow-with-empty-adapter-id",
+            valid_config().replacen("policy = \"deny\"", "policy = \"allow\"", 1)
+                + "\n[[network.allowed]]\nadapter_id = \"   \"\n",
+        ),
+        (
+            "burning-allow-with-empty-drive-id",
+            valid_config().replace(
+                "[burning]\npolicy = \"deny\"",
+                "[burning]\npolicy = \"allow\"\n\n[[burning.allowed]]\ndrive_id = \"   \"",
+            ),
         ),
     ] {
         let config_path = temp.path().join(format!("{name}.toml"));

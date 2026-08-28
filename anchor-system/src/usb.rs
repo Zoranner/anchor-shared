@@ -5,6 +5,9 @@
 //! USB 卷内文件监听属于文件事件适配，首迭代由服务直接使用 notify crate 实现，
 //! 不属于本 crate 职责。
 
+#[cfg(windows)]
+use std::process::Command;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -31,8 +34,11 @@ pub struct UsbAllowRule {
 /// 平台适配层观测到的设备处置意图，不直接调用禁用 API。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsbPlannedAction {
-    KeepEnabled,
+    /// 仅允许的大容量存储设备恢复启用。
+    EnableMassStorage,
     DisableMassStorage,
+    /// 不是 USB 大容量存储设备，拒绝执行设备状态变更。
+    RejectNonMassStorage,
 }
 
 /// USB 存储设备的观测与计划处置结果。
@@ -48,9 +54,17 @@ pub fn plan_usb_storage_control(
     device: UsbStorageDevice,
     allowed: &[UsbAllowRule],
 ) -> UsbControlResult {
+    if !is_usb_mass_storage_instance(&device.instance_id) {
+        return UsbControlResult {
+            device,
+            matched_rule: None,
+            planned_action: UsbPlannedAction::RejectNonMassStorage,
+        };
+    }
+
     let matched_rule = allowed.iter().position(|rule| rule_matches(rule, &device));
     let planned_action = if matched_rule.is_some() {
-        UsbPlannedAction::KeepEnabled
+        UsbPlannedAction::EnableMassStorage
     } else {
         UsbPlannedAction::DisableMassStorage
     };
@@ -62,8 +76,88 @@ pub fn plan_usb_storage_control(
     }
 }
 
+/// 执行 USB 大容量存储设备状态变更的外部边界。
+///
+/// 测试通过该 trait 注入记录型执行器；生产环境使用
+/// [`WindowsUsbStorageExecutor`] 调用 Windows PnPDevice 命令。
+pub trait UsbStorageExecutor {
+    fn set_mass_storage_enabled(
+        &mut self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> Result<(), PlatformError>;
+}
+
+/// 按计划执行 USB 大容量存储设备控制。
+pub fn apply_usb_storage_control<E>(
+    executor: &mut E,
+    result: UsbControlResult,
+) -> Result<(), PlatformError>
+where
+    E: UsbStorageExecutor,
+{
+    match result.planned_action {
+        UsbPlannedAction::EnableMassStorage => {
+            executor.set_mass_storage_enabled(&result.device.instance_id, true)
+        }
+        UsbPlannedAction::DisableMassStorage => {
+            executor.set_mass_storage_enabled(&result.device.instance_id, false)
+        }
+        UsbPlannedAction::RejectNonMassStorage => Err(PlatformError::Failed(
+            "仅支持 USB 大容量存储设备控制".into(),
+        )),
+    }
+}
+
+/// Windows 10 USB 大容量存储设备执行器。
+#[derive(Debug, Default)]
+pub struct WindowsUsbStorageExecutor;
+
+#[cfg(windows)]
+impl UsbStorageExecutor for WindowsUsbStorageExecutor {
+    fn set_mass_storage_enabled(
+        &mut self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> Result<(), PlatformError> {
+        if !is_usb_mass_storage_instance(instance_id) {
+            return Err(PlatformError::Failed(
+                "仅支持 USB 大容量存储设备控制".into(),
+            ));
+        }
+
+        let action = if enabled {
+            "Enable-PnpDevice -InstanceId $args[0] -Confirm:$false -ErrorAction Stop"
+        } else {
+            "Disable-PnpDevice -InstanceId $args[0] -Confirm:$false -ErrorAction Stop"
+        };
+        run_powershell(action, instance_id, "USB 大容量存储设备")
+    }
+}
+
+#[cfg(not(windows))]
+impl UsbStorageExecutor for WindowsUsbStorageExecutor {
+    fn set_mass_storage_enabled(
+        &mut self,
+        _instance_id: &str,
+        _enabled: bool,
+    ) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Windows USB 大容量存储设备控制"))
+    }
+}
+
 fn rule_matches(rule: &UsbAllowRule, device: &UsbStorageDevice) -> bool {
-    matches_optional(&rule.instance_id, Some(&device.instance_id))
+    let has_identifier = [
+        rule.instance_id.as_deref(),
+        rule.vendor_id.as_deref(),
+        rule.product_id.as_deref(),
+        rule.serial.as_deref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some_and(|value| !value.trim().is_empty()));
+
+    has_identifier
+        && matches_optional(&rule.instance_id, Some(&device.instance_id))
         && matches_optional(&rule.vendor_id, device.vendor_id.as_ref())
         && matches_optional(&rule.product_id, device.product_id.as_ref())
         && matches_optional(&rule.serial, device.serial.as_ref())
@@ -71,6 +165,30 @@ fn rule_matches(rule: &UsbAllowRule, device: &UsbStorageDevice) -> bool {
 
 fn matches_optional(expected: &Option<String>, actual: Option<&String>) -> bool {
     expected.as_ref().is_none_or(|value| Some(value) == actual)
+}
+
+fn is_usb_mass_storage_instance(instance_id: &str) -> bool {
+    instance_id
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("USBSTOR\\"))
+}
+
+#[cfg(windows)]
+fn run_powershell(action: &str, instance_id: &str, target: &str) -> Result<(), PlatformError> {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", action])
+        .arg(instance_id)
+        .output()
+        .map_err(|error| PlatformError::Failed(format!("启动 {target} 控制命令失败: {error}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(PlatformError::Failed(format!(
+        "{target} 控制命令失败: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 /// USB 设备信任等级。
@@ -129,7 +247,7 @@ mod tests {
     #[test]
     fn unlisted_mass_storage_is_planned_for_disable() {
         let device = UsbStorageDevice {
-            instance_id: "USB\\VID_1234&PID_5678\\1".into(),
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -142,9 +260,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_allow_rule_is_not_a_wildcard_for_mass_storage() {
+        let device = UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            vendor_id: Some("1234".into()),
+            product_id: Some("5678".into()),
+            serial: Some("1".into()),
+        };
+
+        let result = plan_usb_storage_control(device, &[UsbAllowRule::default()]);
+
+        assert_eq!(result.matched_rule, None);
+        assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
+    }
+
+    #[test]
     fn all_specified_rule_fields_must_match() {
         let device = UsbStorageDevice {
-            instance_id: "USB\\VID_1234&PID_5678\\1".into(),
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -158,6 +291,80 @@ mod tests {
         let result = plan_usb_storage_control(device, &allowed);
 
         assert_eq!(result.matched_rule, Some(0));
-        assert_eq!(result.planned_action, UsbPlannedAction::KeepEnabled);
+        assert_eq!(result.planned_action, UsbPlannedAction::EnableMassStorage);
+    }
+
+    #[test]
+    fn unlisted_mass_storage_is_disabled_through_the_injected_executor() {
+        let device = UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            vendor_id: None,
+            product_id: None,
+            serial: None,
+        };
+        let mut executor = RecordingUsbExecutor::default();
+
+        apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &[])).unwrap();
+
+        assert_eq!(
+            executor.calls,
+            vec![("USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(), false)]
+        );
+    }
+
+    #[test]
+    fn allowed_mass_storage_is_restored_through_the_injected_executor() {
+        let device = UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            vendor_id: None,
+            product_id: None,
+            serial: None,
+        };
+        let allowed = [UsbAllowRule {
+            instance_id: Some(device.instance_id.clone()),
+            ..UsbAllowRule::default()
+        }];
+        let mut executor = RecordingUsbExecutor::default();
+
+        apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &allowed))
+            .unwrap();
+
+        assert_eq!(
+            executor.calls,
+            vec![("USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(), true)]
+        );
+    }
+
+    #[test]
+    fn non_mass_storage_never_reaches_the_executor() {
+        let device = UsbStorageDevice {
+            instance_id: "USB\\VID_1234&PID_5678\\1".into(),
+            vendor_id: None,
+            product_id: None,
+            serial: None,
+        };
+        let mut executor = RecordingUsbExecutor::default();
+
+        let error = apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &[]))
+            .unwrap_err();
+
+        assert!(matches!(error, PlatformError::Failed(_)));
+        assert!(executor.calls.is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingUsbExecutor {
+        calls: Vec<(String, bool)>,
+    }
+
+    impl UsbStorageExecutor for RecordingUsbExecutor {
+        fn set_mass_storage_enabled(
+            &mut self,
+            instance_id: &str,
+            enabled: bool,
+        ) -> Result<(), PlatformError> {
+            self.calls.push((instance_id.into(), enabled));
+            Ok(())
+        }
     }
 }

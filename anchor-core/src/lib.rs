@@ -12,6 +12,6 @@ pub use audit::{verify_chain, AuditEvent, AuditPayload, EventType, GENESIS_HASH}
 pub use error::CoreError;
 pub use policy::{
     decide_import, evaluate_authorization, ActionPolicy, AuthorizationDenial, AuthorizationState,
-    BurningRules, ImportDecision, NetworkRules, PolicyPackage, PolicyPayload, ScanRule,
-    ScanRuleKind, ScanRules, UsbRules,
+    BurningAllowRule, BurningRules, ImportDecision, NetworkAllowRule, NetworkRules, PolicyPackage,
+    PolicyPayload, ScanRule, ScanRuleKind, ScanRules, UsbAllowRule, UsbRules,
 };

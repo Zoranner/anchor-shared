@@ -19,6 +19,14 @@ pub enum ActionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkRules {
     pub policy: ActionPolicy,
+    #[serde(default)]
+    pub allowed: Vec<NetworkAllowRule>,
+}
+
+/// 一条网卡允许规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkAllowRule {
+    pub adapter_id: String,
 }
 
 /// USB 存储控制规则。
@@ -26,12 +34,35 @@ pub struct NetworkRules {
 pub struct UsbRules {
     pub read: ActionPolicy,
     pub write: ActionPolicy,
+    #[serde(default)]
+    pub allowed: Vec<UsbAllowRule>,
+}
+
+/// 一条 USB 大容量存储允许规则。所有已填写字段必须同时匹配。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbAllowRule {
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default)]
+    pub vendor_id: Option<String>,
+    #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub serial: Option<String>,
 }
 
 /// 刻录控制规则。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BurningRules {
     pub policy: ActionPolicy,
+    #[serde(default)]
+    pub allowed: Vec<BurningAllowRule>,
+}
+
+/// 一条刻录光驱允许规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurningAllowRule {
+    pub drive_id: String,
 }
 
 /// 扫描规则类型。
@@ -232,12 +263,15 @@ mod tests {
             usb: UsbRules {
                 read: ActionPolicy::Deny,
                 write: ActionPolicy::Deny,
+                allowed: vec![],
             },
             network: NetworkRules {
                 policy: ActionPolicy::Deny,
+                allowed: vec![],
             },
             burning: BurningRules {
                 policy: ActionPolicy::Deny,
+                allowed: vec![],
             },
             scan: ScanRules {
                 controlled_dirs: vec!["D:\\data".into()],
@@ -275,6 +309,75 @@ mod tests {
         assert!(json.contains("\"signature\":"));
         let back: PolicyPackage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, pkg);
+    }
+
+    #[test]
+    fn policy_json_serializes_explicit_device_allowlists_and_defaults_them_to_empty() {
+        let payload = serde_json::json!({
+            "policy_id": "policy-1",
+            "version": 1,
+            "device_id": "laptop-1",
+            "effective_from": "2026-08-28T07:00:00Z",
+            "effective_until": "2026-09-04T08:00:00Z",
+            "clock_rollback_tolerance_secs": 300,
+            "usb": {
+                "read": "allow",
+                "write": "deny",
+                "allowed": [{
+                    "instance_id": "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1",
+                    "vendor_id": "1234",
+                    "product_id": "5678",
+                    "serial": "1"
+                }]
+            },
+            "network": {
+                "policy": "allow",
+                "allowed": [{ "adapter_id": "nic-private" }]
+            },
+            "burning": {
+                "policy": "deny",
+                "allowed": [{ "drive_id": "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1" }]
+            },
+            "scan": {
+                "controlled_dirs": ["D:\\data"],
+                "rules": []
+            }
+        });
+
+        let parsed: PolicyPayload = serde_json::from_value(payload).unwrap();
+        let serialized = serde_json::to_value(parsed).unwrap();
+
+        assert_eq!(
+            serialized["usb"]["allowed"][0]["instance_id"],
+            "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1"
+        );
+        assert_eq!(
+            serialized["network"]["allowed"][0]["adapter_id"],
+            "nic-private"
+        );
+        assert_eq!(
+            serialized["burning"]["allowed"][0]["drive_id"],
+            "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1"
+        );
+
+        let without_allowlists = serde_json::json!({
+            "policy_id": "policy-1",
+            "version": 1,
+            "device_id": "laptop-1",
+            "effective_from": "2026-08-28T07:00:00Z",
+            "effective_until": "2026-09-04T08:00:00Z",
+            "clock_rollback_tolerance_secs": 300,
+            "usb": { "read": "deny", "write": "deny" },
+            "network": { "policy": "deny" },
+            "burning": { "policy": "deny" },
+            "scan": { "controlled_dirs": ["D:\\data"], "rules": [] }
+        });
+        let parsed: PolicyPayload = serde_json::from_value(without_allowlists).unwrap();
+        let serialized = serde_json::to_value(parsed).unwrap();
+
+        assert_eq!(serialized["usb"]["allowed"], serde_json::json!([]));
+        assert_eq!(serialized["network"]["allowed"], serde_json::json!([]));
+        assert_eq!(serialized["burning"]["allowed"], serde_json::json!([]));
     }
 
     #[test]

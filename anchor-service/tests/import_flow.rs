@@ -26,12 +26,15 @@ fn package(device_id: &str, version: u64, key: &ed25519_dalek::SigningKey) -> Po
             usb: UsbRules {
                 read: ActionPolicy::Deny,
                 write: ActionPolicy::Deny,
+                allowed: vec![],
             },
             network: NetworkRules {
                 policy: ActionPolicy::Allow,
+                allowed: vec![],
             },
             burning: BurningRules {
                 policy: ActionPolicy::Deny,
+                allowed: vec![],
             },
             scan: ScanRules {
                 controlled_dirs: vec!["D:\\workspace".into()],
