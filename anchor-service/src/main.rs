@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use anchor_service::scan_runtime::spawn_active_notify_scan_runtime;
 use anchor_service::{enforce::ObservedDevices, Service};
 use anchor_store::Store;
 use anchor_system::{
@@ -56,6 +58,8 @@ use windows_service::{
 const SERVICE_NAME: &str = "AnchorGuard";
 const LISTEN_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 const ENFORCEMENT_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(windows)]
+const SCAN_STABLE_DELAY: Duration = Duration::from_millis(300);
 
 fn run_enforcement_once<O, L, U, N, B>(
     service: &Service,
@@ -219,6 +223,9 @@ where
     F: Fn() -> bool,
 {
     let service = Arc::new(config.open_service()?);
+    #[cfg(windows)]
+    let _scan_runtime = spawn_active_notify_scan_runtime(Arc::clone(&service), SCAN_STABLE_DELAY)
+        .context("启动文件扫描监听失败")?;
     #[cfg(windows)]
     let mut session_assistant = SessionAssistantLauncher::new(
         LocalSessionAssistantBackend,

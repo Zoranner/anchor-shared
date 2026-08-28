@@ -459,6 +459,56 @@ impl Store {
             .transpose()
     }
 
+    /// 原子更新一条文件扫描索引，并可同时追加对应的命中审计。
+    pub fn upsert_scan_record(
+        &self,
+        record: &ScanRecord,
+        audit: Option<AuditPayload>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let matched_rules_json = serde_json::to_string(&record.matched_rules)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let transaction = connection.transaction()?;
+        if let Some(audit) = audit {
+            Self::append_audit_in(&transaction, audit)?;
+        }
+        transaction.execute(
+            "INSERT INTO scan_index (file_id, path, volume_id, size, mtime, hash, scan_version, status, matched_rules_json, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(file_id) DO UPDATE SET path = excluded.path, volume_id = excluded.volume_id,
+               size = excluded.size, mtime = excluded.mtime, hash = excluded.hash, scan_version = excluded.scan_version,
+               status = excluded.status, matched_rules_json = excluded.matched_rules_json,
+               last_event_id = excluded.last_event_id, updated_at = excluded.updated_at",
+            params![record.file_id, record.path, record.volume_id, record.size as i64, record.mtime,
+                record.hash, record.scan_version as i64, record.status.as_str(), matched_rules_json,
+                record.last_event_id, now.to_rfc3339()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 查询按路径保存的最新扫描记录。
+    pub fn scan_record(&self, path: &str) -> Result<Option<ScanRecord>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        connection.query_row(
+            "SELECT file_id, path, volume_id, size, mtime, hash, scan_version, status, matched_rules_json, last_event_id
+             FROM scan_index WHERE path = ?1 ORDER BY updated_at DESC LIMIT 1",
+            [path],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<String>>(9)?)),
+        ).optional()?.map(|(file_id, path, volume_id, size, mtime, hash, scan_version, status, matched_rules_json, last_event_id)| {
+            Ok(ScanRecord { file_id, path, volume_id, size: size as u64, mtime, hash, scan_version: scan_version as u64,
+                status: status.parse()?, matched_rules: serde_json::from_str(&matched_rules_json)?, last_event_id })
+        }).transpose()
+    }
+
     /// 原子追加一条本地审计事件，并与上一条事件的 hash 连接。
     pub fn append_audit(&self, payload: AuditPayload) -> Result<(), StoreError> {
         let mut connection = self

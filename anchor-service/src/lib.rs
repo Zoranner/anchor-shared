@@ -2,6 +2,7 @@
 
 pub mod enforce;
 pub mod protocol;
+pub mod scan_runtime;
 
 pub use authority::Service;
 
