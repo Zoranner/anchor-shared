@@ -47,6 +47,25 @@ impl Service {
         self.authorization_state_with_enforcement_failure(now, true)
     }
 
+    /// 记录用户会话协作程序故障并进入运行期 fail-closed 状态。
+    pub fn record_session_assistant_failure(
+        &self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), anchor_store::StoreError> {
+        let mut event = AuditPayload::new(
+            &self.device_id,
+            "AnchorGuard",
+            EventType::SessionAssistantFailed,
+            "session_assistant",
+            "failed",
+        );
+        event.timestamp = now;
+        event.resource = Some(reason.into());
+        self.store
+            .append_audit_and_set_enforcement_failure(event, "session_assistant_failed", now)
+    }
+
     pub(crate) fn authorization_state_for_enforcement(
         &self,
         now: DateTime<Utc>,

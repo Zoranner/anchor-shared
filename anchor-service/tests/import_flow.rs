@@ -171,6 +171,21 @@ fn enforcement_failure_denies_authorization_until_a_policy_is_imported() {
 }
 
 #[test]
+fn session_assistant_failure_enters_runtime_fail_closed_state() {
+    let (_, verifying_key) = crypto::generate_keypair();
+    let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
+
+    service
+        .record_session_assistant_failure("session status pipe unavailable", now())
+        .unwrap();
+
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+}
+
+#[test]
 fn authorization_request_returns_a_denied_ipc_response_without_a_policy() {
     let (_, verifying_key) = crypto::generate_keypair();
     let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");

@@ -1,6 +1,10 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -8,8 +12,12 @@ use std::{
 use anchor_service::{enforce::ObservedDevices, Service};
 use anchor_store::Store;
 use anchor_system::{
-    burning::BurningControlExecutor, error::PlatformError, inventory::DeviceInventory,
-    nic::NicControlExecutor, session::SessionLocker, usb::UsbStorageExecutor,
+    burning::BurningControlExecutor,
+    error::PlatformError,
+    inventory::DeviceInventory,
+    nic::NicControlExecutor,
+    session::{SessionAssistantLauncher, SessionAssistantLauncherBackend, SessionLocker},
+    usb::UsbStorageExecutor,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -24,18 +32,15 @@ use clap::Parser;
 
 #[cfg(windows)]
 use anchor_system::{
-    burning::WindowsBurningControlExecutor, inventory::observe_inventory,
-    nic::WindowsNicControlExecutor, session::SessionLockResult, usb::WindowsUsbStorageExecutor,
+    burning::WindowsBurningControlExecutor,
+    inventory::observe_inventory,
+    nic::WindowsNicControlExecutor,
+    session::{LocalSessionAssistantBackend, SessionLockResult},
+    usb::WindowsUsbStorageExecutor,
 };
 
 #[cfg(windows)]
-use std::{
-    ffi::OsString,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::ffi::OsString;
 
 #[cfg(windows)]
 use windows_service::{
@@ -50,6 +55,7 @@ use windows_service::{
 
 const SERVICE_NAME: &str = "AnchorGuard";
 const LISTEN_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
+const ENFORCEMENT_INTERVAL: Duration = Duration::from_millis(500);
 
 fn run_enforcement_once<O, L, U, N, B>(
     service: &Service,
@@ -158,26 +164,99 @@ impl ServiceConfig {
     }
 }
 
+fn spawn_pipe_listener<T, F>(
+    service: Arc<T>,
+    stop_requested: Arc<AtomicBool>,
+    serve_once: F,
+) -> thread::JoinHandle<()>
+where
+    T: Send + Sync + 'static,
+    F: Fn(&T, chrono::DateTime<Utc>) -> Result<(), PlatformError> + Send + 'static,
+{
+    thread::spawn(move || {
+        while !stop_requested.load(Ordering::SeqCst) {
+            if serve_once(&service, Utc::now()).is_err() {
+                thread::sleep(LISTEN_FAILURE_BACKOFF);
+            }
+        }
+    })
+}
+
+fn session_assistant_executable(service_executable: &Path) -> Result<PathBuf> {
+    let directory = service_executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("无法确定 Windows Service 可执行文件目录"))?;
+    Ok(directory.join("anchor-session.exe"))
+}
+
+fn reconcile_session_assistant_once<B>(
+    service: &Service,
+    launcher: &mut SessionAssistantLauncher<B>,
+    now: chrono::DateTime<Utc>,
+) -> Result<()>
+where
+    B: SessionAssistantLauncherBackend,
+{
+    if let Err(error) = launcher.reconcile() {
+        let reason = error.to_string();
+        service
+            .record_session_assistant_failure(&reason, now)
+            .context("记录会话协作程序故障失败")?;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn local_session_assistant_executable() -> Result<PathBuf> {
+    let service_executable =
+        std::env::current_exe().context("读取 Windows Service 可执行文件失败")?;
+    session_assistant_executable(&service_executable)
+}
+
 fn serve_until_stopped<F>(config: ServiceConfig, should_stop: F) -> Result<()>
 where
     F: Fn() -> bool,
 {
-    let service = config.open_service()?;
+    let service = Arc::new(config.open_service()?);
+    #[cfg(windows)]
+    let mut session_assistant = SessionAssistantLauncher::new(
+        LocalSessionAssistantBackend,
+        local_session_assistant_executable()?,
+    );
+    let listener_stop_requested = Arc::new(AtomicBool::new(false));
+    let control_listener = spawn_pipe_listener(
+        Arc::clone(&service),
+        Arc::clone(&listener_stop_requested),
+        |service, now| service.serve_control_pipe_once(now).map(|_| ()),
+    );
+    let session_status_listener = spawn_pipe_listener(
+        Arc::clone(&service),
+        Arc::clone(&listener_stop_requested),
+        |service, now| service.serve_session_status_pipe_once(now).map(|_| ()),
+    );
+
     while !should_stop() {
         let now = Utc::now();
         #[cfg(windows)]
-        let enforcement_failed = run_windows_enforcement_once(&service, now).is_err();
+        let runtime_failed = run_windows_enforcement_once(&service, now).is_err()
+            || reconcile_session_assistant_once(&service, &mut session_assistant, now).is_err();
         #[cfg(not(windows))]
-        let enforcement_failed = false;
-        let control_result = service.serve_control_pipe_once(now);
-        let session_status_result = service.serve_session_status_pipe_once(now);
-        if control_result.is_err()
-            || session_status_result.is_err()
-            || cfg!(windows) && enforcement_failed
-        {
+        let runtime_failed = false;
+        if runtime_failed {
             thread::sleep(LISTEN_FAILURE_BACKOFF);
+        } else {
+            thread::sleep(ENFORCEMENT_INTERVAL);
         }
     }
+
+    listener_stop_requested.store(true, Ordering::SeqCst);
+    control_listener
+        .join()
+        .map_err(|_| anyhow::anyhow!("控制 Named Pipe 监听线程异常退出"))?;
+    session_status_listener
+        .join()
+        .map_err(|_| anyhow::anyhow!("会话状态 Named Pipe 监听线程异常退出"))?;
     Ok(())
 }
 
@@ -268,7 +347,15 @@ fn service_status(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc, Arc,
+        },
+        thread,
+        time::Duration,
+    };
 
     use anchor_core::{crypto, AuthorizationDenial, AuthorizationState, EventType};
     use anchor_service::Service;
@@ -277,12 +364,18 @@ mod tests {
         burning::WindowsBurningControlExecutor,
         error::PlatformError,
         nic::WindowsNicControlExecutor,
-        session::{SessionLockResult, SessionLocker},
+        session::{
+            InteractiveSession, SessionAssistantLauncher, SessionAssistantLauncherBackend,
+            SessionAssistantProcess, SessionLockResult, SessionLocker,
+        },
         usb::WindowsUsbStorageExecutor,
     };
     use chrono::{TimeZone, Utc};
 
-    use super::{run_enforcement_once, ServiceConfig};
+    use super::{
+        reconcile_session_assistant_once, run_enforcement_once, session_assistant_executable,
+        spawn_pipe_listener, ServiceConfig,
+    };
 
     #[derive(Default)]
     struct ServiceSessionLocker {
@@ -294,6 +387,58 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(PlatformError::Failed("test service session".into()))
         }
+    }
+
+    struct ActiveSessionAssistantBackend;
+
+    impl SessionAssistantLauncherBackend for ActiveSessionAssistantBackend {
+        fn interactive_sessions(&self) -> Result<Vec<InteractiveSession>, PlatformError> {
+            Ok(vec![InteractiveSession::active(7)])
+        }
+
+        fn start_session_assistant(
+            &self,
+            session_id: u32,
+            executable: &Path,
+        ) -> Result<SessionAssistantProcess, PlatformError> {
+            assert_eq!(session_id, 7);
+            assert_eq!(executable, Path::new("anchor-session.exe"));
+            Ok(SessionAssistantProcess(42))
+        }
+
+        fn is_session_assistant_running(
+            &self,
+            _process: SessionAssistantProcess,
+        ) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        fn release_session_assistant(&self, _process: SessionAssistantProcess) {}
+    }
+
+    struct FailingSessionAssistantBackend;
+
+    impl SessionAssistantLauncherBackend for FailingSessionAssistantBackend {
+        fn interactive_sessions(&self) -> Result<Vec<InteractiveSession>, PlatformError> {
+            Err(PlatformError::Failed("session enumeration failed".into()))
+        }
+
+        fn start_session_assistant(
+            &self,
+            _session_id: u32,
+            _executable: &Path,
+        ) -> Result<SessionAssistantProcess, PlatformError> {
+            unreachable!("会话枚举失败后不应启动协作程序")
+        }
+
+        fn is_session_assistant_running(
+            &self,
+            _process: SessionAssistantProcess,
+        ) -> Result<bool, PlatformError> {
+            unreachable!("会话枚举失败后不应检查协作程序")
+        }
+
+        fn release_session_assistant(&self, _process: SessionAssistantProcess) {}
     }
 
     fn now() -> chrono::DateTime<Utc> {
@@ -356,5 +501,102 @@ device_id = "laptop-1"
                     .as_deref()
                     .is_some_and(|reason| reason.contains("inventory unavailable"))
         }));
+    }
+
+    #[test]
+    fn session_assistant_executable_uses_the_service_executable_directory() {
+        let service_directory = tempfile::tempdir().unwrap();
+        let service_executable = service_directory.path().join("anchor-service.exe");
+
+        let assistant = session_assistant_executable(&service_executable).unwrap();
+
+        assert_eq!(
+            assistant,
+            service_directory.path().join("anchor-session.exe")
+        );
+    }
+
+    #[test]
+    fn session_assistant_reconciliation_starts_each_interactive_session() {
+        let service = Service::new(
+            Store::in_memory().unwrap(),
+            crypto::generate_keypair().1,
+            "laptop-1",
+        );
+        let mut launcher =
+            SessionAssistantLauncher::new(ActiveSessionAssistantBackend, "anchor-session.exe");
+
+        reconcile_session_assistant_once(&service, &mut launcher, now()).unwrap();
+
+        assert_eq!(launcher.process_for(7), Some(SessionAssistantProcess(42)));
+    }
+
+    #[test]
+    fn session_assistant_reconciliation_failure_is_audited_and_denied() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let service = Service::new(
+            Store::open(database.path()).unwrap(),
+            crypto::generate_keypair().1,
+            "laptop-1",
+        );
+        let mut launcher =
+            SessionAssistantLauncher::new(FailingSessionAssistantBackend, "anchor-session.exe");
+
+        let error = reconcile_session_assistant_once(&service, &mut launcher, now()).unwrap_err();
+
+        assert!(error.to_string().contains("session enumeration failed"));
+        assert_eq!(
+            service.authorization_state(now()),
+            AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+        );
+        drop(service);
+        let events = Store::open_read_only(database.path())
+            .unwrap()
+            .read_audit_events()
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.payload.event_type == EventType::SessionAssistantFailed
+                && event.payload.action == "session_assistant"
+                && event.payload.result == "failed"
+                && event
+                    .payload
+                    .resource
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("session enumeration failed"))
+        }));
+    }
+
+    #[test]
+    fn session_listener_runs_while_control_listener_is_waiting_for_a_client() {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let control_stop = Arc::clone(&stop_requested);
+        let session_stop = Arc::clone(&stop_requested);
+        let (control_started, control_started_receiver) = mpsc::channel();
+        let (session_served, session_served_receiver) = mpsc::channel();
+
+        let control_listener =
+            spawn_pipe_listener(Arc::new(()), Arc::clone(&stop_requested), move |_, _| {
+                control_started.send(()).unwrap();
+                while !control_stop.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                Ok(())
+            });
+        control_started_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+
+        let session_listener =
+            spawn_pipe_listener(Arc::new(()), Arc::clone(&stop_requested), move |_, _| {
+                session_served.send(()).unwrap();
+                session_stop.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+
+        session_served_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        control_listener.join().unwrap();
+        session_listener.join().unwrap();
     }
 }
