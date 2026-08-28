@@ -6,7 +6,11 @@ use anchor_core::{
     EventType, ImportDecision,
 };
 use anchor_store::Store;
-use anchor_system::removable::removable_roots;
+use anchor_system::{
+    error::PlatformError,
+    pipe::{serve_once, PipeServeOutcome, DEFAULT_CONTROL_PIPE},
+    removable::removable_roots,
+};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 
@@ -86,6 +90,36 @@ impl Service {
                 })
             }
         }
+    }
+
+    /// 处理 Named Pipe 传入的 JSON 载荷。
+    ///
+    /// 长度前缀由 `anchor-system::pipe` 负责，业务层仅编解码请求和响应 JSON，
+    /// 以避免在 Credential Provider 与服务之间重复封帧。
+    pub fn handle_json_request(
+        &self,
+        request: &[u8],
+        user: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        let request = serde_json::from_slice(request)?;
+        serde_json::to_vec(&self.handle_request(request, user, now))
+    }
+
+    /// 在固定控制端点处理一条 Credential Provider 请求。
+    ///
+    /// Credential Provider 由 LogonUI 承载，审计主体使用受控进程名称而不是客户端
+    /// 可伪造的输入。Windows Service 的事件循环应重复调用本方法。
+    pub fn serve_control_pipe_once(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PipeServeOutcome, PlatformError> {
+        serve_once(DEFAULT_CONTROL_PIPE, |request| {
+            self.handle_json_request(request, "LogonUI", now)
+                .map_err(|error| {
+                    PlatformError::Failed(format!("Named Pipe JSON 协议错误: {error}"))
+                })
+        })
     }
 
     /// 枚举 Windows 已就绪可移动盘根目录后导入固定策略文件。

@@ -125,3 +125,24 @@ fn authorization_request_returns_a_denied_ipc_response_without_a_policy() {
         })
     );
 }
+
+#[test]
+fn json_authorization_request_returns_a_denied_response_without_a_policy() {
+    let (_, verifying_key) = crypto::generate_keypair();
+    let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
+
+    let response = service
+        .handle_json_request(
+            &serde_json::to_vec(&ServiceRequest::GetAuthorization).unwrap(),
+            "LogonUI",
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        serde_json::from_slice::<ServiceResponse>(&response).unwrap(),
+        ServiceResponse::Authorization(AuthorizationResponse::Denied {
+            reason: "no_active_policy".into(),
+        })
+    );
+}

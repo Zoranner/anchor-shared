@@ -1,6 +1,7 @@
 //! Anchor Guard 平台适配层：设备、网卡、刻录、密钥保护与服务控制。
 
 pub mod error;
+pub mod pipe;
 pub mod removable;
 pub mod usb;
 
