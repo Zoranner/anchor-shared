@@ -1,8 +1,8 @@
 use std::fs;
 
 use anchor_core::{
-    crypto, ActionPolicy, AuthorizationState, BurningRules, NetworkRules, PolicyPackage,
-    PolicyPayload, ScanRules, UsbRules,
+    crypto, ActionPolicy, AuthorizationDenial, AuthorizationState, BurningRules, ImportDecision,
+    NetworkRules, PolicyPackage, PolicyPayload, ScanRules, UsbRules,
 };
 use anchor_service::protocol::{AuthorizationResponse, ServiceRequest, ServiceResponse};
 use anchor_service::Service;
@@ -117,6 +117,60 @@ fn authorization_remembers_the_latest_trusted_time_for_rollback_detection() {
 }
 
 #[test]
+fn enforcement_failure_denies_authorization_until_a_policy_is_imported() {
+    let (signing_key, verifying_key) = crypto::generate_keypair();
+    let store = Store::in_memory().unwrap();
+    store
+        .import_policy(
+            &package("laptop-1", 1, &signing_key),
+            ImportDecision::Accept,
+            "laptop-1",
+            "alice",
+            now(),
+        )
+        .unwrap();
+    store
+        .set_enforcement_failure("USB control failed", now())
+        .unwrap();
+    let service = Service::new(store, verifying_key, "laptop-1");
+
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+    assert_eq!(
+        serde_json::from_slice::<ServiceResponse>(
+            &service
+                .handle_session_status_request(
+                    &serde_json::to_vec(&ServiceRequest::GetAuthorization).unwrap(),
+                    now(),
+                )
+                .unwrap(),
+        )
+        .unwrap(),
+        ServiceResponse::Authorization(AuthorizationResponse::Denied {
+            reason: "enforcement_unhealthy".into(),
+        })
+    );
+
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("anchor-guard.policy"),
+        serde_json::to_vec(&package("laptop-1", 2, &signing_key)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        service
+            .import_from_roots(&[root.path()], "alice", now())
+            .accepted
+    );
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Allowed
+    );
+}
+
+#[test]
 fn authorization_request_returns_a_denied_ipc_response_without_a_policy() {
     let (_, verifying_key) = crypto::generate_keypair();
     let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
@@ -148,4 +202,19 @@ fn json_authorization_request_returns_a_denied_response_without_a_policy() {
             reason: "no_active_policy".into(),
         })
     );
+}
+
+#[test]
+fn session_status_pipe_rejects_policy_import_requests() {
+    let (_, verifying_key) = crypto::generate_keypair();
+    let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
+
+    let error = service
+        .handle_session_status_request(
+            &serde_json::to_vec(&ServiceRequest::ImportFromRemovableRoots).unwrap(),
+            now(),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("只接受授权查询"));
 }

@@ -186,6 +186,7 @@ pub enum AuthorizationDenial {
     TrustedTimeUnavailable,
     ClockRollback,
     AuditUnhealthy,
+    EnforcementUnhealthy,
 }
 
 /// Windows 正常登录和受控设备执行共用的授权状态。

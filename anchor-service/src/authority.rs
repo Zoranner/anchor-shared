@@ -8,7 +8,7 @@ use anchor_core::{
 use anchor_store::Store;
 use anchor_system::{
     error::PlatformError,
-    pipe::{serve_once, PipeServeOutcome, DEFAULT_CONTROL_PIPE},
+    pipe::{serve_once, serve_session_status_once, PipeServeOutcome, DEFAULT_CONTROL_PIPE},
     removable::removable_roots,
 };
 use chrono::{DateTime, Utc};
@@ -44,6 +44,30 @@ impl Service {
     /// 返回 Windows 登录和设备执行共用的当前授权结论。
     /// 存储不可读、链异常或运行状态无法解析时一律拒绝。
     pub fn authorization_state(&self, now: DateTime<Utc>) -> AuthorizationState {
+        self.authorization_state_with_enforcement_failure(now, true)
+    }
+
+    pub(crate) fn authorization_state_for_enforcement(
+        &self,
+        now: DateTime<Utc>,
+    ) -> AuthorizationState {
+        self.authorization_state_with_enforcement_failure(now, false)
+    }
+
+    fn authorization_state_with_enforcement_failure(
+        &self,
+        now: DateTime<Utc>,
+        check_enforcement_failure: bool,
+    ) -> AuthorizationState {
+        if check_enforcement_failure {
+            match self.store.enforcement_failure() {
+                Ok(Some(_)) => {
+                    return AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+                }
+                Ok(None) => {}
+                Err(_) => return AuthorizationState::Denied(AuthorizationDenial::AuditUnhealthy),
+            }
+        }
         let active_policy = match self.store.active_policy() {
             Ok(policy) => policy,
             Err(_) => return AuthorizationState::Denied(AuthorizationDenial::AuditUnhealthy),
@@ -106,6 +130,26 @@ impl Service {
         serde_json::to_vec(&self.handle_request(request, user, now))
     }
 
+    /// 处理用户会话状态端点传入的 JSON 授权查询。
+    ///
+    /// 此端点面向已登录用户，固定只读；策略导入仍只能通过受 `SYSTEM` 限制的控制端点
+    /// 发起，避免会话协作程序获得导入能力。
+    pub fn handle_session_status_request(
+        &self,
+        request: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<u8>, PlatformError> {
+        let request = serde_json::from_slice(request)
+            .map_err(|error| PlatformError::Failed(format!("会话状态 JSON 协议错误: {error}")))?;
+        let ServiceRequest::GetAuthorization = request else {
+            return Err(PlatformError::Failed("会话状态端点只接受授权查询".into()));
+        };
+        serde_json::to_vec(&ServiceResponse::Authorization(authorization_response(
+            self.authorization_state(now),
+        )))
+        .map_err(|error| PlatformError::Failed(format!("会话状态 JSON 编码错误: {error}")))
+    }
+
     /// 在固定控制端点处理一条 Credential Provider 请求。
     ///
     /// Credential Provider 由 LogonUI 承载，审计主体使用受控进程名称而不是客户端
@@ -120,6 +164,14 @@ impl Service {
                     PlatformError::Failed(format!("Named Pipe JSON 协议错误: {error}"))
                 })
         })
+    }
+
+    /// 在会话状态端点处理一条仅查询授权的请求。
+    pub fn serve_session_status_pipe_once(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PipeServeOutcome, PlatformError> {
+        serve_session_status_once(|request| self.handle_session_status_request(request, now))
     }
 
     /// 枚举 Windows 已就绪可移动盘根目录后导入固定策略文件。
@@ -252,6 +304,7 @@ fn authorization_response(state: AuthorizationState) -> AuthorizationResponse {
                 AuthorizationDenial::TrustedTimeUnavailable => "trusted_time_unavailable",
                 AuthorizationDenial::ClockRollback => "clock_rollback",
                 AuthorizationDenial::AuditUnhealthy => "audit_unhealthy",
+                AuthorizationDenial::EnforcementUnhealthy => "enforcement_unhealthy",
             }
             .into(),
         },

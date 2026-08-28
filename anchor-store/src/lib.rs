@@ -7,7 +7,10 @@ pub use error::StoreError;
 pub use types::{DeviceStateRecord, EventFilter, ScanRecord, ScanStatus};
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 use anchor_core::{
     verify_chain, AuditEvent, AuditPayload, EventType, ImportDecision, PolicyPackage, GENESIS_HASH,
@@ -15,9 +18,12 @@ use anchor_core::{
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
+const ENFORCEMENT_FAILURE_KEY: &str = "enforcement_failure";
+
 /// 本机 SQLite 存储。所有写入经由单个连接串行化，以维持审计链顺序。
 pub struct Store {
     connection: Mutex<Connection>,
+    enforcement_failure_write_failed: AtomicBool,
 }
 
 impl Store {
@@ -32,6 +38,7 @@ impl Store {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            enforcement_failure_write_failed: AtomicBool::new(false),
         })
     }
 
@@ -43,6 +50,7 @@ impl Store {
     fn from_connection(connection: Connection) -> Result<Self, StoreError> {
         let store = Self {
             connection: Mutex::new(connection),
+            enforcement_failure_write_failed: AtomicBool::new(false),
         };
         store.initialize()?;
         Ok(store)
@@ -173,8 +181,16 @@ impl Store {
                 now,
             )?;
             Self::set_runtime_in(&transaction, "last_trusted_at", &now.to_rfc3339(), now)?;
+            transaction.execute(
+                "DELETE FROM runtime_state WHERE key = ?1",
+                params![ENFORCEMENT_FAILURE_KEY],
+            )?;
         }
         transaction.commit()?;
+        if decision == ImportDecision::Accept {
+            self.enforcement_failure_write_failed
+                .store(false, Ordering::SeqCst);
+        }
         Ok(decision)
     }
 
@@ -246,6 +262,72 @@ impl Store {
         Ok(())
     }
 
+    /// 记录本轮设备处置或状态持久化失败的原因。
+    pub fn set_enforcement_failure(
+        &self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let transaction = connection.transaction()?;
+        let result = (|| {
+            Self::set_runtime_in(&transaction, ENFORCEMENT_FAILURE_KEY, reason, now)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.enforcement_failure_write_failed
+                .store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// 清除已由完整处置或成功策略导入恢复的运行期失败状态。
+    pub fn clear_enforcement_failure(&self) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let result = connection.execute(
+            "DELETE FROM runtime_state WHERE key = ?1",
+            params![ENFORCEMENT_FAILURE_KEY],
+        );
+        match result {
+            Ok(_) => {
+                self.enforcement_failure_write_failed
+                    .store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                self.enforcement_failure_write_failed
+                    .store(true, Ordering::SeqCst);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// 读取尚未恢复的设备处置或状态持久化失败原因。
+    pub fn enforcement_failure(&self) -> Result<Option<String>, StoreError> {
+        if self.enforcement_failure_write_failed.load(Ordering::SeqCst) {
+            return Ok(Some("enforcement_state_persistence_failed".into()));
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        connection
+            .query_row(
+                "SELECT value FROM runtime_state WHERE key = ?1",
+                params![ENFORCEMENT_FAILURE_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// 原子写入设备最近状态；同一设备类别和设备 ID 始终保留最新记录。
     pub fn upsert_device_state(
         &self,
@@ -282,6 +364,31 @@ impl Store {
         Self::upsert_device_state_json_in(&transaction, kind, device_id, &state_json, now)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// 在同一事务中记录处置失败审计并设置运行期失败状态。
+    pub fn append_audit_and_set_enforcement_failure(
+        &self,
+        payload: AuditPayload,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let transaction = connection.transaction()?;
+        let result = (|| {
+            Self::append_audit_in(&transaction, payload)?;
+            Self::set_runtime_in(&transaction, ENFORCEMENT_FAILURE_KEY, reason, now)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.enforcement_failure_write_failed
+                .store(true, Ordering::SeqCst);
+        }
+        result
     }
 
     fn upsert_device_state_in(
@@ -778,5 +885,41 @@ mod tests {
             store.device_state("usb", "USB\\VID_1234&PID_5678").unwrap(),
             None,
         );
+    }
+
+    #[test]
+    fn enforcement_failure_is_readable_and_can_be_cleared() {
+        let store = Store::in_memory().unwrap();
+
+        store
+            .set_enforcement_failure("USB control failed", now())
+            .unwrap();
+        assert_eq!(
+            store.enforcement_failure().unwrap(),
+            Some("USB control failed".into())
+        );
+
+        store.clear_enforcement_failure().unwrap();
+        assert_eq!(store.enforcement_failure().unwrap(), None);
+    }
+
+    #[test]
+    fn accepted_policy_import_clears_enforcement_failure() {
+        let store = Store::in_memory().unwrap();
+        store
+            .set_enforcement_failure("USB control failed", now())
+            .unwrap();
+
+        store
+            .import_policy(
+                &package(1, "laptop-1"),
+                ImportDecision::Accept,
+                "laptop-1",
+                "admin",
+                now(),
+            )
+            .unwrap();
+
+        assert_eq!(store.enforcement_failure().unwrap(), None);
     }
 }

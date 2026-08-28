@@ -8,6 +8,7 @@ use anchor_store::StoreError;
 use anchor_system::{
     burning::{apply_burning_control, BurnDriveInfo, BurningControlExecutor},
     error::PlatformError,
+    inventory::DeviceInventory,
     nic::{apply_nic_control, NicControlExecutor, NicInfo},
     session::SessionLocker,
     usb::{
@@ -27,6 +28,16 @@ pub struct ObservedDevices {
     pub usb_storage: Vec<UsbStorageDevice>,
     pub adapters: Vec<NicInfo>,
     pub burn_drives: Vec<BurnDriveInfo>,
+}
+
+impl From<DeviceInventory> for ObservedDevices {
+    fn from(inventory: DeviceInventory) -> Self {
+        Self {
+            usb_storage: inventory.usb_storage,
+            adapters: inventory.network_adapters,
+            burn_drives: inventory.burn_drives,
+        }
+    }
 }
 
 /// 网卡的计划处置。
@@ -113,6 +124,28 @@ impl ExecutionFailure {
 }
 
 impl Service {
+    /// 记录库存观测失败并进入运行期 fail-closed 状态。
+    pub fn record_inventory_failure(
+        &self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut event = AuditPayload::new(
+            &self.device_id,
+            "AnchorGuard",
+            EventType::InventoryObservationFailed,
+            "observe_inventory",
+            "failed",
+        );
+        event.timestamp = now;
+        event.resource = Some(reason.into());
+        self.store.append_audit_and_set_enforcement_failure(
+            event,
+            "inventory_observation_failed",
+            now,
+        )
+    }
+
     /// 根据当前活动策略处理已观测设备。
     ///
     /// 授权拒绝时立即请求锁定会话并写入审计。授权允许时，仅根据明确 allowlist
@@ -151,7 +184,10 @@ impl Service {
         N: NicControlExecutor,
         B: BurningControlExecutor,
     {
-        let outcome = self.apply_policy(locker, observed, now)?;
+        let outcome = match self.authorization_state_for_enforcement(now) {
+            AuthorizationState::Denied(reason) => self.lock_denied_session(locker, reason, now)?,
+            AuthorizationState::Allowed => self.plan_allowed_devices(observed, now)?,
+        };
         let EnforcementOutcome::DevicePlans(plans) = outcome else {
             return Ok(outcome);
         };
@@ -189,26 +225,29 @@ impl Service {
 
         for plan in &plans.usb {
             if let Err(error) = apply_usb_storage_control(usb_executor, plan.clone()) {
-                let audit = self.append_enforcement_audit(
+                let failure = ExecutionFailure::DeviceControl(error);
+                let persistence = self.record_execution_failure(
                     EventType::UsbAttach,
                     "apply_usb_control",
-                    "failed",
-                    Some((&plan.device.instance_id, policy_version)),
+                    &plan.device.instance_id,
+                    policy_version,
+                    &failure,
                     now,
                 );
-                remember_execution_failure(
-                    &mut first_failure,
-                    audit.map_or_else(ExecutionFailure::StatePersistence, |_| {
-                        ExecutionFailure::DeviceControl(error)
-                    }),
-                );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
                 continue;
             }
             if let Err(error) = self.persist_usb_plan(plan, policy_version, now) {
-                remember_execution_failure(
-                    &mut first_failure,
-                    ExecutionFailure::StatePersistence(error),
+                let failure = ExecutionFailure::StatePersistence(error);
+                let persistence = self.record_execution_failure(
+                    EventType::UsbAttach,
+                    "persist_usb_control",
+                    &plan.device.instance_id,
+                    policy_version,
+                    &failure,
+                    now,
                 );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
             }
         }
 
@@ -216,26 +255,29 @@ impl Service {
             if let Err(error) =
                 apply_nic_control(nic_executor, &plan.adapter_id, plan.enabled, &allowed_nics)
             {
-                let audit = self.append_enforcement_audit(
+                let failure = ExecutionFailure::DeviceControl(error);
+                let persistence = self.record_execution_failure(
                     EventType::NicChange,
                     "apply_nic_control",
-                    "failed",
-                    Some((&plan.adapter_id, policy_version)),
+                    &plan.adapter_id,
+                    policy_version,
+                    &failure,
                     now,
                 );
-                remember_execution_failure(
-                    &mut first_failure,
-                    audit.map_or_else(ExecutionFailure::StatePersistence, |_| {
-                        ExecutionFailure::DeviceControl(error)
-                    }),
-                );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
                 continue;
             }
             if let Err(error) = self.persist_nic_plan(plan, policy_version, now) {
-                remember_execution_failure(
-                    &mut first_failure,
-                    ExecutionFailure::StatePersistence(error),
+                let failure = ExecutionFailure::StatePersistence(error);
+                let persistence = self.record_execution_failure(
+                    EventType::NicChange,
+                    "persist_nic_control",
+                    &plan.adapter_id,
+                    policy_version,
+                    &failure,
+                    now,
                 );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
             }
         }
 
@@ -246,30 +288,44 @@ impl Service {
                 plan.enabled,
                 &allowed_burn_drives,
             ) {
-                let audit = self.append_enforcement_audit(
+                let failure = ExecutionFailure::DeviceControl(error);
+                let persistence = self.record_execution_failure(
                     EventType::BurnTask,
                     "apply_burning_control",
-                    "failed",
-                    Some((&plan.drive_id, policy_version)),
+                    &plan.drive_id,
+                    policy_version,
+                    &failure,
                     now,
                 );
-                remember_execution_failure(
-                    &mut first_failure,
-                    audit.map_or_else(ExecutionFailure::StatePersistence, |_| {
-                        ExecutionFailure::DeviceControl(error)
-                    }),
-                );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
                 continue;
             }
             if let Err(error) = self.persist_burning_plan(plan, policy_version, now) {
-                remember_execution_failure(
-                    &mut first_failure,
-                    ExecutionFailure::StatePersistence(error),
+                let failure = ExecutionFailure::StatePersistence(error);
+                let persistence = self.record_execution_failure(
+                    EventType::BurnTask,
+                    "persist_burning_control",
+                    &plan.drive_id,
+                    policy_version,
+                    &failure,
+                    now,
                 );
+                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
             }
         }
 
         if let Some(failure) = first_failure {
+            return match self.lock_after_device_control_failure(locker, now) {
+                Ok(()) => Err(failure.into_error()),
+                Err(EnforcementError::SessionLock(session)) => {
+                    Err(failure.with_session_lock_error(session))
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        if let Err(error) = self.store.clear_enforcement_failure() {
+            let failure = ExecutionFailure::StatePersistence(error);
             return match self.lock_after_device_control_failure(locker, now) {
                 Ok(()) => Err(failure.into_error()),
                 Err(EnforcementError::SessionLock(session)) => {
@@ -416,6 +472,28 @@ impl Service {
         )
     }
 
+    fn record_execution_failure(
+        &self,
+        event_type: EventType,
+        action: &str,
+        resource: &str,
+        policy_version: u64,
+        failure: &ExecutionFailure,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.store.append_audit_and_set_enforcement_failure(
+            self.enforcement_audit_payload(
+                event_type,
+                action,
+                "failed",
+                Some((resource, policy_version)),
+                now,
+            ),
+            execution_failure_reason(failure),
+            now,
+        )
+    }
+
     fn lock_after_device_control_failure<L>(
         &self,
         locker: &L,
@@ -556,6 +634,24 @@ fn remember_execution_failure(slot: &mut Option<ExecutionFailure>, failure: Exec
     }
 }
 
+fn remember_persisted_execution_failure(
+    slot: &mut Option<ExecutionFailure>,
+    persistence: Result<(), StoreError>,
+    failure: ExecutionFailure,
+) {
+    remember_execution_failure(
+        slot,
+        persistence.map_or_else(ExecutionFailure::StatePersistence, |_| failure),
+    );
+}
+
+fn execution_failure_reason(failure: &ExecutionFailure) -> &'static str {
+    match failure {
+        ExecutionFailure::DeviceControl(_) => "device_control_failed",
+        ExecutionFailure::StatePersistence(_) => "state_persistence_failed",
+    }
+}
+
 fn authorization_denial_reason(reason: AuthorizationDenial) -> &'static str {
     match reason {
         AuthorizationDenial::NoActivePolicy => "no_active_policy",
@@ -565,5 +661,6 @@ fn authorization_denial_reason(reason: AuthorizationDenial) -> &'static str {
         AuthorizationDenial::TrustedTimeUnavailable => "trusted_time_unavailable",
         AuthorizationDenial::ClockRollback => "clock_rollback",
         AuthorizationDenial::AuditUnhealthy => "audit_unhealthy",
+        AuthorizationDenial::EnforcementUnhealthy => "enforcement_unhealthy",
     }
 }

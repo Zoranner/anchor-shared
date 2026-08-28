@@ -1,6 +1,6 @@
 use anchor_core::{
-    ActionPolicy, BurningRules, ImportDecision, NetworkRules, PolicyPackage, PolicyPayload,
-    ScanRules, UsbAllowRule, UsbRules,
+    ActionPolicy, AuthorizationDenial, AuthorizationState, BurningRules, ImportDecision,
+    NetworkRules, PolicyPackage, PolicyPayload, ScanRules, UsbAllowRule, UsbRules,
 };
 use anchor_service::{
     enforce::{EnforcementOutcome, ObservedDevices},
@@ -265,6 +265,43 @@ fn enforce_policy_executes_unlisted_usb_disable_after_planning() {
 }
 
 #[test]
+fn successful_enforcement_clears_a_previous_runtime_failure() {
+    let store = Store::in_memory().unwrap();
+    let (signing_key, verifying_key) = anchor_core::crypto::generate_keypair();
+    let package = active_policy_package(&signing_key);
+    store
+        .import_policy(&package, ImportDecision::Accept, "laptop-1", "test", now())
+        .unwrap();
+    store
+        .set_enforcement_failure("USB control failed", now())
+        .unwrap();
+    let service = Service::new(store, verifying_key, "laptop-1");
+    let locker = RecordingLocker::default();
+    let observed = ObservedDevices {
+        usb_storage: vec![UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            vendor_id: None,
+            product_id: None,
+            serial: None,
+        }],
+        ..ObservedDevices::default()
+    };
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor;
+    let mut burning = RecordingBurningExecutor;
+
+    service
+        .enforce_policy(&locker, &mut usb, &mut nic, &mut burning, observed, now())
+        .unwrap();
+
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Allowed
+    );
+    assert_eq!(locker.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
 fn device_control_failure_still_processes_all_devices_then_locks_the_session() {
     let service = service_with_active_policy();
     let locker = RecordingLocker::default();
@@ -299,6 +336,10 @@ fn device_control_failure_still_processes_all_devices_then_locks_the_session() {
     ));
     assert_eq!(usb.calls.len(), 2);
     assert_eq!(locker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
 }
 
 #[test]
@@ -345,4 +386,64 @@ fn state_persistence_failure_after_device_control_locks_the_session() {
     ));
     assert_eq!(usb.calls.len(), 1);
     assert_eq!(locker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+}
+
+#[test]
+fn runtime_failure_state_write_failure_does_not_leave_service_authorized() {
+    let database = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(database.path()).unwrap();
+    let (signing_key, verifying_key) = anchor_core::crypto::generate_keypair();
+    let package = active_policy_package(&signing_key);
+    store
+        .import_policy(&package, ImportDecision::Accept, "laptop-1", "test", now())
+        .unwrap();
+    rusqlite::Connection::open(database.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_enforcement_failure
+             BEFORE INSERT ON runtime_state
+             WHEN NEW.key = 'enforcement_failure'
+             BEGIN
+               SELECT RAISE(ABORT, 'enforcement failure rejected');
+             END;",
+        )
+        .unwrap();
+    let service = Service::new(store, verifying_key, "laptop-1");
+    let locker = RecordingLocker::default();
+    let observed = ObservedDevices {
+        usb_storage: vec![UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            vendor_id: None,
+            product_id: None,
+            serial: None,
+        }],
+        ..ObservedDevices::default()
+    };
+    let mut usb = FailingFirstUsbExecutor::default();
+    let mut nic = RecordingNicExecutor;
+    let mut burning = RecordingBurningExecutor;
+
+    let error = service
+        .enforce_policy(&locker, &mut usb, &mut nic, &mut burning, observed, now())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        anchor_service::enforce::EnforcementError::StatePersistence(_)
+    ));
+    assert_eq!(
+        service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+    let events = Store::open_read_only(database.path())
+        .unwrap()
+        .read_audit_events()
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.payload.action == "apply_usb_control"));
 }

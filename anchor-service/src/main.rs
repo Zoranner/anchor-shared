@@ -5,8 +5,12 @@ use std::{
     time::Duration,
 };
 
-use anchor_service::Service;
+use anchor_service::{enforce::ObservedDevices, Service};
 use anchor_store::Store;
+use anchor_system::{
+    burning::BurningControlExecutor, error::PlatformError, inventory::DeviceInventory,
+    nic::NicControlExecutor, session::SessionLocker, usb::UsbStorageExecutor,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
@@ -17,6 +21,12 @@ use anyhow::bail;
 
 #[cfg(windows)]
 use clap::Parser;
+
+#[cfg(windows)]
+use anchor_system::{
+    burning::WindowsBurningControlExecutor, inventory::observe_inventory,
+    nic::WindowsNicControlExecutor, session::SessionLockResult, usb::WindowsUsbStorageExecutor,
+};
 
 #[cfg(windows)]
 use std::{
@@ -40,6 +50,74 @@ use windows_service::{
 
 const SERVICE_NAME: &str = "AnchorGuard";
 const LISTEN_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
+
+fn run_enforcement_once<O, L, U, N, B>(
+    service: &Service,
+    observe: O,
+    locker: &L,
+    usb_executor: &mut U,
+    nic_executor: &mut N,
+    burning_executor: &mut B,
+    now: chrono::DateTime<Utc>,
+) -> Result<()>
+where
+    O: FnOnce() -> Result<DeviceInventory, PlatformError>,
+    L: SessionLocker,
+    U: UsbStorageExecutor,
+    N: NicControlExecutor,
+    B: BurningControlExecutor,
+{
+    let inventory = match observe() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            service
+                .record_inventory_failure(&error.to_string(), now)
+                .context("记录库存观测失败状态失败")?;
+            return Err(error.into());
+        }
+    };
+    service
+        .enforce_policy(
+            locker,
+            usb_executor,
+            nic_executor,
+            burning_executor,
+            ObservedDevices::from(inventory),
+            now,
+        )
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy)]
+struct ServiceSessionLocker;
+
+#[cfg(windows)]
+impl SessionLocker for ServiceSessionLocker {
+    fn lock_current_session(&self) -> Result<SessionLockResult, PlatformError> {
+        Err(PlatformError::Failed(
+            "Windows Service 在 Session 0 中不能锁定交互用户会话".into(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_enforcement_once(service: &Service, now: chrono::DateTime<Utc>) -> Result<()> {
+    let locker = ServiceSessionLocker;
+    let mut usb = WindowsUsbStorageExecutor;
+    let mut nic = WindowsNicControlExecutor;
+    let mut burning = WindowsBurningControlExecutor;
+    run_enforcement_once(
+        service,
+        observe_inventory,
+        &locker,
+        &mut usb,
+        &mut nic,
+        &mut burning,
+        now,
+    )
+}
 
 /// 安装程序写入的本地服务配置。
 #[derive(Debug, Deserialize)]
@@ -86,7 +164,17 @@ where
 {
     let service = config.open_service()?;
     while !should_stop() {
-        if service.serve_control_pipe_once(Utc::now()).is_err() {
+        let now = Utc::now();
+        #[cfg(windows)]
+        let enforcement_failed = run_windows_enforcement_once(&service, now).is_err();
+        #[cfg(not(windows))]
+        let enforcement_failed = false;
+        let control_result = service.serve_control_pipe_once(now);
+        let session_status_result = service.serve_session_status_pipe_once(now);
+        if control_result.is_err()
+            || session_status_result.is_err()
+            || cfg!(windows) && enforcement_failed
+        {
             thread::sleep(LISTEN_FAILURE_BACKOFF);
         }
     }
@@ -180,7 +268,37 @@ fn service_status(
 
 #[cfg(test)]
 mod tests {
-    use super::ServiceConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use anchor_core::{crypto, AuthorizationDenial, AuthorizationState, EventType};
+    use anchor_service::Service;
+    use anchor_store::Store;
+    use anchor_system::{
+        burning::WindowsBurningControlExecutor,
+        error::PlatformError,
+        nic::WindowsNicControlExecutor,
+        session::{SessionLockResult, SessionLocker},
+        usb::WindowsUsbStorageExecutor,
+    };
+    use chrono::{TimeZone, Utc};
+
+    use super::{run_enforcement_once, ServiceConfig};
+
+    #[derive(Default)]
+    struct ServiceSessionLocker {
+        calls: AtomicUsize,
+    }
+
+    impl SessionLocker for ServiceSessionLocker {
+        fn lock_current_session(&self) -> Result<SessionLockResult, PlatformError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PlatformError::Failed("test service session".into()))
+        }
+    }
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap()
+    }
 
     #[test]
     fn service_config_requires_database_key_and_device_id() {
@@ -195,5 +313,48 @@ device_id = "laptop-1"
 
         assert_eq!(config.device_id, "laptop-1");
         assert_eq!(config.verifying_key_hex.len(), 64);
+    }
+
+    #[test]
+    fn failed_inventory_records_audited_runtime_denial_without_a_session_zero_lock() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(database.path()).unwrap();
+        let service = Service::new(store, crypto::generate_keypair().1, "laptop-1");
+        let locker = ServiceSessionLocker::default();
+        let mut usb = WindowsUsbStorageExecutor;
+        let mut nic = WindowsNicControlExecutor;
+        let mut burning = WindowsBurningControlExecutor;
+
+        let error = run_enforcement_once(
+            &service,
+            || Err(PlatformError::Failed("inventory unavailable".into())),
+            &locker,
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            now(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("inventory unavailable"));
+        assert_eq!(locker.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service.authorization_state(now()),
+            AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+        );
+        let events = Store::open_read_only(database.path())
+            .unwrap()
+            .read_audit_events()
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.payload.event_type == EventType::InventoryObservationFailed
+                && event.payload.action == "observe_inventory"
+                && event.payload.result == "failed"
+                && event
+                    .payload
+                    .resource
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("inventory unavailable"))
+        }));
     }
 }

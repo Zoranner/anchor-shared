@@ -10,7 +10,11 @@ pub const MAX_PIPE_MESSAGE_BYTES: usize = 64 * 1024;
 /// Anchor Guard 服务的固定本地端点。
 pub const DEFAULT_CONTROL_PIPE: &str = r"\\.\pipe\AnchorGuard.Control";
 
+/// 供当前用户会话查询授权状态的固定本地端点。
+pub const SESSION_STATUS_PIPE: &str = r"\\.\pipe\AnchorGuard.SessionStatus";
+
 const CONTROLLED_CLIENT_SDDL: &str = "D:P(A;;GA;;;SY)";
+const SESSION_STATUS_CLIENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)";
 
 /// 服务端一次监听的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,15 @@ pub const fn controlled_client_sddl() -> &'static str {
     CONTROLLED_CLIENT_SDDL
 }
 
+/// 返回会话状态端点使用的访问控制描述符。
+///
+/// 服务自身以 `SYSTEM` 身份拥有完整访问；`Authenticated Users` 仅获得发起请求和
+/// 读取响应所需的通用读写权限。调用端仍需验证服务端为 LocalSystem。
+#[must_use]
+pub const fn session_status_client_sddl() -> &'static str {
+    SESSION_STATUS_CLIENT_SDDL
+}
+
 /// 判断字符串是否为 Windows 本地 Named Pipe 路径。
 #[must_use]
 pub fn is_named_pipe_path(path: &str) -> bool {
@@ -44,12 +57,30 @@ pub fn serve_once<F>(pipe_name: &str, handler: F) -> Result<PipeServeOutcome, Pl
 where
     F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
 {
-    windows::serve_once(pipe_name, handler)
+    windows::serve_once(pipe_name, controlled_client_sddl(), handler)
 }
 
 /// 非 Windows 平台没有可支持的本地登录管控端点。
 #[cfg(not(windows))]
 pub fn serve_once<F>(_pipe_name: &str, _handler: F) -> Result<PipeServeOutcome, PlatformError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
+{
+    Err(PlatformError::Unsupported("Windows Named Pipe"))
+}
+
+/// 服务端处理一次用户会话的只读授权状态查询。
+#[cfg(windows)]
+pub fn serve_session_status_once<F>(handler: F) -> Result<PipeServeOutcome, PlatformError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
+{
+    windows::serve_once(SESSION_STATUS_PIPE, session_status_client_sddl(), handler)
+}
+
+/// 非 Windows 平台没有可支持的本地会话状态端点。
+#[cfg(not(windows))]
+pub fn serve_session_status_once<F>(_handler: F) -> Result<PipeServeOutcome, PlatformError>
 where
     F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
 {
@@ -87,9 +118,7 @@ mod windows {
 
     use crate::{
         error::PlatformError,
-        pipe::{
-            controlled_client_sddl, is_named_pipe_path, PipeServeOutcome, MAX_PIPE_MESSAGE_BYTES,
-        },
+        pipe::{is_named_pipe_path, PipeServeOutcome, MAX_PIPE_MESSAGE_BYTES},
     };
 
     const ERROR_IO_PENDING: i32 = 997;
@@ -253,13 +282,14 @@ mod windows {
 
     pub(super) fn serve_once<F>(
         pipe_name: &str,
+        client_sddl: &str,
         handler: F,
     ) -> Result<PipeServeOutcome, PlatformError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
     {
         let name = wide(pipe_name)?;
-        let descriptor = security_descriptor()?;
+        let descriptor = security_descriptor(client_sddl)?;
         let attributes = SecurityAttributes {
             length: size_of::<SecurityAttributes>() as u32,
             security_descriptor: descriptor.0,
@@ -321,8 +351,8 @@ mod windows {
         read_message_overlapped(client.0, deadline)
     }
 
-    fn security_descriptor() -> Result<SecurityDescriptor, PlatformError> {
-        let sddl = wide(controlled_client_sddl())?;
+    fn security_descriptor(client_sddl: &str) -> Result<SecurityDescriptor, PlatformError> {
+        let sddl = security_descriptor_wide(client_sddl);
         let mut descriptor = std::ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -336,6 +366,10 @@ mod windows {
             return Err(last_error("创建 Named Pipe 访问控制失败"));
         }
         Ok(SecurityDescriptor(descriptor))
+    }
+
+    fn security_descriptor_wide(client_sddl: &str) -> Vec<u16> {
+        wide_nul(client_sddl)
     }
 
     fn wide(value: &str) -> Result<Vec<u16>, PlatformError> {
@@ -611,7 +645,10 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        use super::{connection_wait_outcome, ConnectionWaitOutcome, WAIT_TIMEOUT};
+        use super::{
+            connection_wait_outcome, security_descriptor_wide, ConnectionWaitOutcome, WAIT_TIMEOUT,
+        };
+        use crate::pipe::session_status_client_sddl;
 
         #[test]
         fn failed_connection_wait_is_not_treated_as_an_idle_listener() {
@@ -624,16 +661,37 @@ mod windows {
                 ConnectionWaitOutcome::Failed
             );
         }
+
+        #[test]
+        fn security_descriptor_sddl_does_not_require_a_pipe_path() {
+            let encoded = security_descriptor_wide(session_status_client_sddl());
+
+            assert_eq!(
+                String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
+                session_status_client_sddl()
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{controlled_client_sddl, is_named_pipe_path, MAX_PIPE_MESSAGE_BYTES};
+    use super::{
+        controlled_client_sddl, is_named_pipe_path, session_status_client_sddl,
+        MAX_PIPE_MESSAGE_BYTES,
+    };
 
     #[test]
     fn control_pipe_accepts_only_the_logonui_system_identity() {
         assert_eq!(controlled_client_sddl(), "D:P(A;;GA;;;SY)");
+    }
+
+    #[test]
+    fn session_status_pipe_grants_only_the_service_and_authenticated_users() {
+        assert_eq!(
+            session_status_client_sddl(),
+            "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)"
+        );
     }
 
     #[test]
