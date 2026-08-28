@@ -2,7 +2,7 @@
 //!
 //! 后续接入点：Windows 使用设备到达通知和卷挂载事件，Linux 使用 udev 和挂载事件。
 //! 事件监听（设备接入、移除、卷挂载）后续迭代补充为独立方法或流式接口。
-//! USB 卷内文件监听属于文件事件适配，首迭代由 agent 直接使用 notify crate 实现，
+//! USB 卷内文件监听属于文件事件适配，首迭代由服务直接使用 notify crate 实现，
 //! 不属于本 crate 职责。
 
 use chrono::{DateTime, Utc};
