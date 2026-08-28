@@ -14,9 +14,12 @@ pub const GENESIS_HASH: &str = "000000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    PolicySync,
-    PolicyValidation,
-    ApprovalSync,
+    PolicyImported,
+    PolicyImportRejected,
+    AuthorizationDenied,
+    ClockRollback,
+    SessionLocked,
+    SessionAssistantFailed,
     FileWrite,
     ScanHit,
     UsbAttach,
@@ -36,9 +39,12 @@ impl EventType {
     /// 落库用的 snake_case 字符串表示，与 serde 序列化一致。
     pub fn as_str(self) -> &'static str {
         match self {
-            EventType::PolicySync => "policy_sync",
-            EventType::PolicyValidation => "policy_validation",
-            EventType::ApprovalSync => "approval_sync",
+            EventType::PolicyImported => "policy_imported",
+            EventType::PolicyImportRejected => "policy_import_rejected",
+            EventType::AuthorizationDenied => "authorization_denied",
+            EventType::ClockRollback => "clock_rollback",
+            EventType::SessionLocked => "session_locked",
+            EventType::SessionAssistantFailed => "session_assistant_failed",
             EventType::FileWrite => "file_write",
             EventType::ScanHit => "scan_hit",
             EventType::UsbAttach => "usb_attach",
@@ -61,9 +67,12 @@ impl std::str::FromStr for EventType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let found = match s {
-            "policy_sync" => EventType::PolicySync,
-            "policy_validation" => EventType::PolicyValidation,
-            "approval_sync" => EventType::ApprovalSync,
+            "policy_imported" => EventType::PolicyImported,
+            "policy_import_rejected" => EventType::PolicyImportRejected,
+            "authorization_denied" => EventType::AuthorizationDenied,
+            "clock_rollback" => EventType::ClockRollback,
+            "session_locked" => EventType::SessionLocked,
+            "session_assistant_failed" => EventType::SessionAssistantFailed,
             "file_write" => EventType::FileWrite,
             "scan_hit" => EventType::ScanHit,
             "usb_attach" => EventType::UsbAttach,
@@ -100,7 +109,6 @@ pub struct AuditPayload {
     pub process: Option<String>,
     pub resource: Option<String>,
     pub policy_version: Option<u64>,
-    pub approval_id: Option<String>,
     pub action: String,
     pub result: String,
     pub rule_id: Option<String>,
@@ -125,7 +133,6 @@ impl AuditPayload {
             process: None,
             resource: None,
             policy_version: None,
-            approval_id: None,
             action: action.into(),
             result: result.into(),
             rule_id: None,
@@ -145,11 +152,6 @@ impl AuditPayload {
 
     pub fn with_policy_version(mut self, version: u64) -> Self {
         self.policy_version = Some(version);
-        self
-    }
-
-    pub fn with_approval_id(mut self, approval_id: impl Into<String>) -> Self {
-        self.approval_id = Some(approval_id.into());
         self
     }
 
@@ -263,7 +265,11 @@ mod tests {
     #[test]
     fn event_type_str_roundtrip() {
         for et in [
-            EventType::PolicySync,
+            EventType::PolicyImported,
+            EventType::AuthorizationDenied,
+            EventType::ClockRollback,
+            EventType::SessionLocked,
+            EventType::SessionAssistantFailed,
             EventType::ScanHit,
             EventType::UsbWrite,
             EventType::ServiceStart,
@@ -274,8 +280,8 @@ mod tests {
         assert!("not_a_type".parse::<EventType>().is_err());
         // 与 serde 序列化保持一致
         assert_eq!(
-            serde_json::to_string(&EventType::PolicySync).unwrap(),
-            "\"policy_sync\""
+            serde_json::to_string(&EventType::PolicyImported).unwrap(),
+            "\"policy_imported\""
         );
     }
 
