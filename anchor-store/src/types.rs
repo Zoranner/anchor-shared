@@ -69,9 +69,9 @@ impl ScanRecord {
     ) -> Self {
         let path = path.into();
         let hash = hash.into();
-        let file_id =
-            anchor_core::crypto::sha256_hex(format!("{path}:{mtime}:{size}").as_bytes())[..16]
-                .to_string();
+        let file_id = anchor_core::crypto::sha256_hex(format!("{path}:{mtime}:{size}").as_bytes())
+            [..16]
+            .to_string();
         Self {
             file_id,
             path,
