@@ -5,18 +5,16 @@
 //! USB 卷内文件监听属于文件事件适配，首迭代由服务直接使用 notify crate 实现，
 //! 不属于本 crate 职责。
 
-#[cfg(windows)]
-use std::process::Command;
-
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-
 use crate::error::PlatformError;
+#[cfg(windows)]
+use crate::pnp;
 
 /// 大容量存储设备的稳定标识，用于按策略匹配。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbStorageDevice {
     pub instance_id: String,
+    /// 观测到的启用状态；被禁用的大容量存储设备不会出现在磁盘枚举中。
+    pub enabled: bool,
     pub vendor_id: Option<String>,
     pub product_id: Option<String>,
     pub serial: Option<String>,
@@ -88,27 +86,6 @@ pub trait UsbStorageExecutor {
     ) -> Result<(), PlatformError>;
 }
 
-/// 按计划执行 USB 大容量存储设备控制。
-pub fn apply_usb_storage_control<E>(
-    executor: &mut E,
-    result: UsbControlResult,
-) -> Result<(), PlatformError>
-where
-    E: UsbStorageExecutor,
-{
-    match result.planned_action {
-        UsbPlannedAction::EnableMassStorage => {
-            executor.set_mass_storage_enabled(&result.device.instance_id, true)
-        }
-        UsbPlannedAction::DisableMassStorage => {
-            executor.set_mass_storage_enabled(&result.device.instance_id, false)
-        }
-        UsbPlannedAction::RejectNonMassStorage => Err(PlatformError::Failed(
-            "仅支持 USB 大容量存储设备控制".into(),
-        )),
-    }
-}
-
 /// Windows 10 USB 大容量存储设备执行器。
 #[derive(Debug, Default)]
 pub struct WindowsUsbStorageExecutor;
@@ -125,13 +102,7 @@ impl UsbStorageExecutor for WindowsUsbStorageExecutor {
                 "仅支持 USB 大容量存储设备控制".into(),
             ));
         }
-
-        let action = if enabled {
-            "Enable-PnpDevice -InstanceId $args[0] -Confirm:$false -ErrorAction Stop"
-        } else {
-            "Disable-PnpDevice -InstanceId $args[0] -Confirm:$false -ErrorAction Stop"
-        };
-        run_powershell(action, instance_id, "USB 大容量存储设备")
+        pnp::set_enabled(&pnp::DISK_DRIVE_CLASS, instance_id, enabled)
     }
 }
 
@@ -167,87 +138,66 @@ fn matches_optional(expected: &Option<String>, actual: Option<&String>) -> bool 
     expected.as_ref().is_none_or(|value| Some(value) == actual)
 }
 
-fn is_usb_mass_storage_instance(instance_id: &str) -> bool {
+/// 判断实例标识是否属于 USB 大容量存储设备。
+pub fn is_usb_mass_storage_instance(instance_id: &str) -> bool {
     instance_id
         .get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("USBSTOR\\"))
 }
 
-#[cfg(windows)]
-fn run_powershell(action: &str, instance_id: &str, target: &str) -> Result<(), PlatformError> {
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", action])
-        .arg(instance_id)
-        .output()
-        .map_err(|error| PlatformError::Failed(format!("启动 {target} 控制命令失败: {error}")))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(PlatformError::Failed(format!(
-        "{target} 控制命令失败: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+/// 从 USB 父设备实例标识解析厂商与产品标识，形如 `USB\VID_0951&PID_1666\...`。
+pub fn parse_usb_vendor_product(parent_instance_id: &str) -> (Option<String>, Option<String>) {
+    let upper = parent_instance_id.to_ascii_uppercase();
+    let field = |prefix: &str| {
+        upper
+            .find(prefix)
+            .and_then(|start| upper.get(start + prefix.len()..start + prefix.len() + 4))
+            .filter(|value| value.chars().all(|character| character.is_ascii_hexdigit()))
+            .map(str::to_string)
+    };
+    (field("VID_"), field("PID_"))
 }
 
-/// USB 设备信任等级。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustLevel {
-    /// 未识别。
-    Unknown,
-    /// 未授信，按策略限制使用。
-    Untrusted,
-    /// 已授信，按策略放行。
-    Trusted,
-}
-
-/// USB 存储设备信息；探测阶段可能拿不到全部字段，故标识类字段均为 Option。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsbDeviceInfo {
-    /// 设备 ID。
-    pub device_id: Option<String>,
-    /// 厂商 ID。
-    pub vendor_id: Option<String>,
-    /// 产品 ID。
-    pub product_id: Option<String>,
-    /// 设备序列号。
-    pub serial: Option<String>,
-    /// 卷标识。
-    pub volume_id: Option<String>,
-    /// 盘符或挂载点。
-    pub drive_letter: Option<String>,
-    /// 首次接入时间。
-    pub first_seen: Option<DateTime<Utc>>,
-    /// 最近接入时间。
-    pub last_seen: Option<DateTime<Utc>>,
-    /// 设备信任等级。
-    pub trust_level: TrustLevel,
-}
-
-/// USB 设备监控能力。
-pub trait UsbMonitor: Send + Sync {
-    /// 列出当前已接入的 USB 存储设备。
-    fn list_devices(&self) -> Result<Vec<UsbDeviceInfo>, PlatformError>;
+/// 从 USB 大容量存储实例标识提取序列号，形如 `USBSTOR\Disk&Ven_X&Prod_Y\SERIAL`。
+pub fn usb_storage_serial(instance_id: &str) -> Option<String> {
+    let mut segments = instance_id.splitn(3, '\\');
+    segments.next()?;
+    segments.next()?;
+    let serial = segments.next()?.trim();
+    (!serial.is_empty()).then(|| serial.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::assert_variant_roundtrip;
 
     #[test]
-    fn trust_level_serde_snake_case_roundtrip() {
-        assert_variant_roundtrip(&TrustLevel::Unknown, "unknown");
-        assert_variant_roundtrip(&TrustLevel::Untrusted, "untrusted");
-        assert_variant_roundtrip(&TrustLevel::Trusted, "trusted");
+    fn vendor_and_product_ids_come_from_the_parent_usb_device() {
+        let (vendor_id, product_id) =
+            parse_usb_vendor_product("USB\\VID_0951&PID_1666\\0019E06B1234");
+
+        assert_eq!(vendor_id.as_deref(), Some("0951"));
+        assert_eq!(product_id.as_deref(), Some("1666"));
+        assert_eq!(
+            parse_usb_vendor_product("USB\\ROOT_HUB30\\4&abc"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn storage_serial_is_the_last_instance_id_segment() {
+        assert_eq!(
+            usb_storage_serial("USBSTOR\\Disk&Ven_Example&Prod_Storage\\0019E06B").as_deref(),
+            Some("0019E06B")
+        );
+        assert_eq!(usb_storage_serial("USBSTOR\\Disk&Ven_Example"), None);
     }
 
     #[test]
     fn unlisted_mass_storage_is_planned_for_disable() {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            enabled: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -263,6 +213,7 @@ mod tests {
     fn empty_allow_rule_is_not_a_wildcard_for_mass_storage() {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            enabled: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -278,6 +229,7 @@ mod tests {
     fn all_specified_rule_fields_must_match() {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            enabled: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -294,77 +246,26 @@ mod tests {
         assert_eq!(result.planned_action, UsbPlannedAction::EnableMassStorage);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn unlisted_mass_storage_is_disabled_through_the_injected_executor() {
-        let device = UsbStorageDevice {
-            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
-            vendor_id: None,
-            product_id: None,
-            serial: None,
-        };
-        let mut executor = RecordingUsbExecutor::default();
-
-        apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &[])).unwrap();
-
-        assert_eq!(
-            executor.calls,
-            vec![("USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(), false)]
-        );
-    }
-
-    #[test]
-    fn allowed_mass_storage_is_restored_through_the_injected_executor() {
-        let device = UsbStorageDevice {
-            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
-            vendor_id: None,
-            product_id: None,
-            serial: None,
-        };
-        let allowed = [UsbAllowRule {
-            instance_id: Some(device.instance_id.clone()),
-            ..UsbAllowRule::default()
-        }];
-        let mut executor = RecordingUsbExecutor::default();
-
-        apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &allowed))
-            .unwrap();
-
-        assert_eq!(
-            executor.calls,
-            vec![("USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(), true)]
-        );
-    }
-
-    #[test]
-    fn non_mass_storage_never_reaches_the_executor() {
+    fn non_mass_storage_is_rejected_before_any_device_control_runs() {
         let device = UsbStorageDevice {
             instance_id: "USB\\VID_1234&PID_5678\\1".into(),
+            enabled: true,
             vendor_id: None,
             product_id: None,
             serial: None,
         };
-        let mut executor = RecordingUsbExecutor::default();
+        assert_eq!(
+            plan_usb_storage_control(device, &[]).planned_action,
+            UsbPlannedAction::RejectNonMassStorage
+        );
+        let mut executor = WindowsUsbStorageExecutor;
 
-        let error = apply_usb_storage_control(&mut executor, plan_usb_storage_control(device, &[]))
+        let error = executor
+            .set_mass_storage_enabled("USB\\VID_1234&PID_5678\\1", false)
             .unwrap_err();
 
         assert!(matches!(error, PlatformError::Failed(_)));
-        assert!(executor.calls.is_empty());
-    }
-
-    #[derive(Default)]
-    struct RecordingUsbExecutor {
-        calls: Vec<(String, bool)>,
-    }
-
-    impl UsbStorageExecutor for RecordingUsbExecutor {
-        fn set_mass_storage_enabled(
-            &mut self,
-            instance_id: &str,
-            enabled: bool,
-        ) -> Result<(), PlatformError> {
-            self.calls.push((instance_id.into(), enabled));
-            Ok(())
-        }
     }
 }
