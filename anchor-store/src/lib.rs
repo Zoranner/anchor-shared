@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 const ENFORCEMENT_FAILURE_KEY: &str = "enforcement_failure";
+const AUTHORIZATION_DENIAL_KEY: &str = "authorization_denial";
 
 /// 本机 SQLite 存储。所有写入经由单个连接串行化，以维持审计链顺序。
 pub struct Store {
@@ -66,13 +67,11 @@ impl Store {
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS policies (
                 id INTEGER PRIMARY KEY,
-                policy_id TEXT NOT NULL,
                 version INTEGER NOT NULL,
-                device_id TEXT NOT NULL,
                 package_json TEXT NOT NULL,
                 imported_at TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
-                UNIQUE (policy_id, version)
+                UNIQUE (version)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_policy
                 ON policies(active) WHERE active = 1;
@@ -128,7 +127,7 @@ impl Store {
         &self,
         package: &PolicyPackage,
         decision: ImportDecision,
-        local_device_id: &str,
+        device_id: &str,
         user: &str,
         now: DateTime<Utc>,
     ) -> Result<ImportDecision, StoreError> {
@@ -142,34 +141,27 @@ impl Store {
             ImportDecision::InvalidSignature => {
                 (EventType::PolicyImportRejected, "invalid_signature")
             }
-            ImportDecision::DeviceMismatch => (EventType::PolicyImportRejected, "device_mismatch"),
             ImportDecision::VersionNotNewer => {
                 (EventType::PolicyImportRejected, "version_not_newer")
             }
-            ImportDecision::OutsideEffectiveWindow => {
-                (EventType::PolicyImportRejected, "outside_effective_window")
-            }
+            ImportDecision::Expired => (EventType::PolicyImportRejected, "expired"),
         };
-        let mut payload =
-            AuditPayload::new(local_device_id, user, event_type, "import_policy", result)
-                .with_policy_version(package.payload.version);
+        let mut payload = AuditPayload::new(device_id, user, event_type, "import_policy", result)
+            .with_policy_version(package.payload.version);
         payload.timestamp = now;
         Self::append_audit_in(&transaction, payload)?;
 
         if decision == ImportDecision::Accept {
             transaction.execute("UPDATE policies SET active = 0 WHERE active = 1", [])?;
             transaction.execute(
-                "INSERT INTO policies (policy_id, version, device_id, package_json, imported_at, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1)
-                 ON CONFLICT(policy_id, version) DO UPDATE SET
-                   device_id = excluded.device_id,
+                "INSERT INTO policies (version, package_json, imported_at, active)
+                 VALUES (?1, ?2, ?3, 1)
+                 ON CONFLICT(version) DO UPDATE SET
                    package_json = excluded.package_json,
                    imported_at = excluded.imported_at,
                    active = 1",
                 params![
-                    package.payload.policy_id,
                     package.payload.version as i64,
-                    package.payload.device_id,
                     serde_json::to_string(package)?,
                     now.to_rfc3339(),
                 ],
@@ -328,6 +320,53 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// 读取上一次已记录的授权拒绝原因；未记录拒绝时为 None。
+    pub fn authorization_denial(&self) -> Result<Option<String>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        connection
+            .query_row(
+                "SELECT value FROM runtime_state WHERE key = ?1",
+                params![AUTHORIZATION_DENIAL_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 在同一事务中记录授权拒绝审计并保存当前拒绝原因。
+    pub fn append_audit_and_set_authorization_denial(
+        &self,
+        payload: AuditPayload,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let transaction = connection.transaction()?;
+        Self::append_audit_in(&transaction, payload)?;
+        Self::set_runtime_in(&transaction, AUTHORIZATION_DENIAL_KEY, reason, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 清除已记录的授权拒绝原因；授权恢复后下一次拒绝必须重新记录。
+    pub fn clear_authorization_denial(&self) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        connection.execute(
+            "DELETE FROM runtime_state WHERE key = ?1",
+            params![AUTHORIZATION_DENIAL_KEY],
+        )?;
+        Ok(())
+    }
+
     /// 原子写入设备最近状态；同一设备类别和设备 ID 始终保留最新记录。
     pub fn upsert_device_state(
         &self,
@@ -457,6 +496,51 @@ impl Store {
                 })
             })
             .transpose()
+    }
+
+    /// 列出某一设备类别下已保存的全部设备状态。
+    pub fn device_states(&self, kind: &str) -> Result<Vec<DeviceStateRecord>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT device_id, state_json, updated_at FROM device_state
+             WHERE kind = ?1 ORDER BY device_id",
+        )?;
+        let rows = statement.query_map([kind], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (device_id, state_json, updated_at) = row?;
+            records.push(DeviceStateRecord {
+                kind: kind.to_string(),
+                device_id,
+                state: serde_json::from_str(&state_json)?,
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                    .map_err(|_| StoreError::TimeParse(updated_at.clone()))?
+                    .with_timezone(&Utc),
+            });
+        }
+        Ok(records)
+    }
+
+    /// 删除单个设备状态；设备移除后重新接入必须重新处置并重新记录。
+    pub fn delete_device_state(&self, kind: &str, device_id: &str) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        connection.execute(
+            "DELETE FROM device_state WHERE kind = ?1 AND device_id = ?2",
+            params![kind, device_id],
+        )?;
+        Ok(())
     }
 
     /// 原子更新一条文件扫描索引，并可同时追加对应的命中审计。
@@ -663,16 +747,12 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap()
     }
 
-    fn package(version: u64, device_id: &str) -> PolicyPackage {
+    fn package(version: u64) -> PolicyPackage {
         let (key, _) = crypto::generate_keypair();
         PolicyPackage::sign(
             PolicyPayload {
-                policy_id: "policy-1".into(),
                 version,
-                device_id: device_id.into(),
-                effective_from: now() - Duration::hours(1),
-                effective_until: now() + Duration::days(1),
-                clock_rollback_tolerance_secs: 300,
+                expires_at: now() + Duration::days(1),
                 usb: UsbRules {
                     read: ActionPolicy::Deny,
                     write: ActionPolicy::Deny,
@@ -699,23 +779,22 @@ mod tests {
     #[test]
     fn rejected_import_keeps_active_policy_and_appends_a_rejection_event() {
         let store = Store::in_memory().unwrap();
-        let active = package(1, "laptop-1");
+        let active = package(1);
         store
             .import_policy(&active, ImportDecision::Accept, "laptop-1", "admin", now())
             .unwrap();
-        let wrong_device = package(2, "other-laptop");
 
         assert_eq!(
             store
                 .import_policy(
-                    &wrong_device,
-                    ImportDecision::DeviceMismatch,
+                    &package(1),
+                    ImportDecision::VersionNotNewer,
                     "laptop-1",
                     "admin",
                     now()
                 )
                 .unwrap(),
-            ImportDecision::DeviceMismatch,
+            ImportDecision::VersionNotNewer,
         );
         assert_eq!(store.active_policy().unwrap().unwrap().payload.version, 1);
         assert!(store.audit_chain_healthy().unwrap());
@@ -726,7 +805,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         store
             .import_policy(
-                &package(1, "laptop-1"),
+                &package(1),
                 ImportDecision::Accept,
                 "laptop-1",
                 "admin",
@@ -737,7 +816,7 @@ mod tests {
         assert_eq!(
             store
                 .import_policy(
-                    &package(2, "laptop-1"),
+                    &package(2),
                     ImportDecision::InvalidSignature,
                     "laptop-1",
                     "admin",
@@ -755,7 +834,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         store
             .import_policy(
-                &package(1, "laptop-1"),
+                &package(1),
                 ImportDecision::Accept,
                 "laptop-1",
                 "admin",
@@ -764,7 +843,7 @@ mod tests {
             .unwrap();
         store
             .import_policy(
-                &package(2, "laptop-1"),
+                &package(2),
                 ImportDecision::Accept,
                 "laptop-1",
                 "admin",
@@ -781,7 +860,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         store
             .import_policy(
-                &package(1, "laptop-1"),
+                &package(1),
                 ImportDecision::Accept,
                 "laptop-1",
                 "admin",
@@ -962,7 +1041,7 @@ mod tests {
 
         store
             .import_policy(
-                &package(1, "laptop-1"),
+                &package(1),
                 ImportDecision::Accept,
                 "laptop-1",
                 "admin",
