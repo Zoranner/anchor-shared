@@ -94,17 +94,17 @@ pub struct ScanRules {
 /// `serde_json::to_vec` 输出确定字节，可直接作为签名载荷。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyPayload {
-    pub policy_id: String,
     pub version: u64,
-    pub device_id: String,
-    pub effective_from: DateTime<Utc>,
-    pub effective_until: DateTime<Utc>,
-    pub clock_rollback_tolerance_secs: u64,
+    /// 策略到期时间；策略从导入时刻起生效。
+    pub expires_at: DateTime<Utc>,
     pub usb: UsbRules,
     pub network: NetworkRules,
     pub burning: BurningRules,
     pub scan: ScanRules,
 }
+
+/// 允许的系统时间回拨容差；超出该范围即视为时间篡改并拒绝授权。
+pub const CLOCK_ROLLBACK_TOLERANCE_SECS: u64 = 300;
 
 /// 带管理员签名的策略包。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,37 +141,31 @@ impl PolicyPackage {
 /// 从可移动介质导入策略的校验结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDecision {
-    /// 签名、设备、版本和当前有效期均通过，可以替换本地策略。
+    /// 签名、版本和到期时间均通过，可以替换本地策略。
     Accept,
     /// 策略包签名无效。
     InvalidSignature,
-    /// 策略包不属于当前设备。
-    DeviceMismatch,
     /// 策略版本没有严格递增。
     VersionNotNewer,
-    /// 策略尚未生效或已过期。
-    OutsideEffectiveWindow,
+    /// 策略已过期。
+    Expired,
 }
 
 /// 验证从 U 盘导入的策略包。
 pub fn decide_import(
     pkg: &PolicyPackage,
     key: &VerifyingKey,
-    device_id: &str,
     current_version: Option<u64>,
     now: DateTime<Utc>,
 ) -> ImportDecision {
     if !pkg.verify_signature(key) {
         return ImportDecision::InvalidSignature;
     }
-    if pkg.payload.device_id != device_id {
-        return ImportDecision::DeviceMismatch;
-    }
     if current_version.is_some_and(|version| pkg.payload.version <= version) {
         return ImportDecision::VersionNotNewer;
     }
-    if now < pkg.payload.effective_from || now > pkg.payload.effective_until {
-        return ImportDecision::OutsideEffectiveWindow;
+    if now > pkg.payload.expires_at {
+        return ImportDecision::Expired;
     }
     ImportDecision::Accept
 }
@@ -180,8 +174,6 @@ pub fn decide_import(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorizationDenial {
     NoActivePolicy,
-    DeviceMismatch,
-    NotYetEffective,
     Expired,
     TrustedTimeUnavailable,
     ClockRollback,
@@ -202,7 +194,6 @@ pub enum AuthorizationState {
 /// 审计链或最后可信时间时保持拒绝，避免把状态不明误判为已授权。
 pub fn evaluate_authorization(
     active_policy: Option<&PolicyPackage>,
-    device_id: &str,
     now: DateTime<Utc>,
     last_trusted_at: Option<DateTime<Utc>>,
     audit_healthy: bool,
@@ -214,26 +205,16 @@ pub fn evaluate_authorization(
     let Some(policy) = active_policy else {
         return AuthorizationState::Denied(AuthorizationDenial::NoActivePolicy);
     };
-    if policy.payload.device_id != device_id {
-        return AuthorizationState::Denied(AuthorizationDenial::DeviceMismatch);
-    }
-    if now < policy.payload.effective_from {
-        return AuthorizationState::Denied(AuthorizationDenial::NotYetEffective);
-    }
-    if now > policy.payload.effective_until {
+    if now > policy.payload.expires_at {
         return AuthorizationState::Denied(AuthorizationDenial::Expired);
     }
 
     let Some(last_trusted_at) = last_trusted_at else {
         return AuthorizationState::Denied(AuthorizationDenial::TrustedTimeUnavailable);
     };
-    let tolerance = Duration::try_seconds(
-        policy
-            .payload
-            .clock_rollback_tolerance_secs
-            .min(i64::MAX as u64) as i64,
-    )
-    .unwrap_or(Duration::MAX);
+    let tolerance =
+        Duration::try_seconds(CLOCK_ROLLBACK_TOLERANCE_SECS.min(i64::MAX as u64) as i64)
+            .unwrap_or(Duration::MAX);
     let earliest_allowed = last_trusted_at
         .checked_sub_signed(tolerance)
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
@@ -255,12 +236,8 @@ mod tests {
 
     fn sample_payload(version: u64) -> PolicyPayload {
         PolicyPayload {
-            policy_id: "policy-1".into(),
             version,
-            device_id: "laptop-1".into(),
-            effective_from: now() - Duration::hours(1),
-            effective_until: now() + Duration::days(7),
-            clock_rollback_tolerance_secs: 300,
+            expires_at: now() + Duration::days(7),
             usb: UsbRules {
                 read: ActionPolicy::Deny,
                 write: ActionPolicy::Deny,
@@ -305,8 +282,8 @@ mod tests {
         let (sk, _) = crypto::generate_keypair();
         let pkg = PolicyPackage::sign(sample_payload(3), &sk).unwrap();
         let json = serde_json::to_string(&pkg).unwrap();
-        assert!(json.contains("\"policy_id\":\"policy-1\""));
-        assert!(json.contains("\"device_id\":\"laptop-1\""));
+        assert!(json.contains("\"version\":3"));
+        assert!(json.contains("\"expires_at\":"));
         assert!(json.contains("\"signature\":"));
         let back: PolicyPackage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, pkg);
@@ -315,12 +292,8 @@ mod tests {
     #[test]
     fn policy_json_serializes_explicit_device_allowlists_and_defaults_them_to_empty() {
         let payload = serde_json::json!({
-            "policy_id": "policy-1",
             "version": 1,
-            "device_id": "laptop-1",
-            "effective_from": "2026-08-28T07:00:00Z",
-            "effective_until": "2026-09-04T08:00:00Z",
-            "clock_rollback_tolerance_secs": 300,
+            "expires_at": "2026-09-04T08:00:00Z",
             "usb": {
                 "read": "allow",
                 "write": "deny",
@@ -362,12 +335,8 @@ mod tests {
         );
 
         let without_allowlists = serde_json::json!({
-            "policy_id": "policy-1",
             "version": 1,
-            "device_id": "laptop-1",
-            "effective_from": "2026-08-28T07:00:00Z",
-            "effective_until": "2026-09-04T08:00:00Z",
-            "clock_rollback_tolerance_secs": 300,
+            "expires_at": "2026-09-04T08:00:00Z",
             "usb": { "read": "deny", "write": "deny" },
             "network": { "policy": "deny" },
             "burning": { "policy": "deny" },
@@ -382,12 +351,12 @@ mod tests {
     }
 
     #[test]
-    fn signed_current_policy_for_the_registered_device_is_accepted() {
+    fn signed_current_policy_is_accepted() {
         let (sk, vk) = crypto::generate_keypair();
         let pkg = PolicyPackage::sign(sample_payload(2), &sk).unwrap();
 
         assert_eq!(
-            decide_import(&pkg, &vk, "laptop-1", Some(1), now()),
+            decide_import(&pkg, &vk, Some(1), now()),
             ImportDecision::Accept
         );
     }
@@ -396,24 +365,11 @@ mod tests {
     fn import_rejects_tampered_package_before_other_checks() {
         let (sk, vk) = crypto::generate_keypair();
         let mut pkg = PolicyPackage::sign(sample_payload(1), &sk).unwrap();
-        pkg.payload.device_id = "other-laptop".into();
+        pkg.payload.version = 99;
 
         assert_eq!(
-            decide_import(&pkg, &vk, "laptop-1", Some(1), now()),
+            decide_import(&pkg, &vk, Some(1), now()),
             ImportDecision::InvalidSignature
-        );
-    }
-
-    #[test]
-    fn import_rejects_a_package_for_another_device() {
-        let (sk, vk) = crypto::generate_keypair();
-        let mut payload = sample_payload(2);
-        payload.device_id = "other-laptop".into();
-        let pkg = PolicyPackage::sign(payload, &sk).unwrap();
-
-        assert_eq!(
-            decide_import(&pkg, &vk, "laptop-1", Some(1), now()),
-            ImportDecision::DeviceMismatch
         );
     }
 
@@ -423,29 +379,21 @@ mod tests {
         let pkg = PolicyPackage::sign(sample_payload(2), &sk).unwrap();
 
         assert_eq!(
-            decide_import(&pkg, &vk, "laptop-1", Some(2), now()),
+            decide_import(&pkg, &vk, Some(2), now()),
             ImportDecision::VersionNotNewer
         );
     }
 
     #[test]
-    fn import_rejects_policies_outside_the_effective_window() {
+    fn import_rejects_an_expired_policy() {
         let (sk, vk) = crypto::generate_keypair();
-        let mut future = sample_payload(2);
-        future.effective_from = now() + Duration::minutes(1);
-        let future = PolicyPackage::sign(future, &sk).unwrap();
-
         let mut expired = sample_payload(3);
-        expired.effective_until = now() - Duration::minutes(1);
+        expired.expires_at = now() - Duration::minutes(1);
         let expired = PolicyPackage::sign(expired, &sk).unwrap();
 
         assert_eq!(
-            decide_import(&future, &vk, "laptop-1", Some(1), now()),
-            ImportDecision::OutsideEffectiveWindow
-        );
-        assert_eq!(
-            decide_import(&expired, &vk, "laptop-1", Some(1), now()),
-            ImportDecision::OutsideEffectiveWindow
+            decide_import(&expired, &vk, Some(1), now()),
+            ImportDecision::Expired
         );
     }
 
@@ -455,7 +403,7 @@ mod tests {
         let pkg = PolicyPackage::sign(sample_payload(1), &sk).unwrap();
 
         assert_eq!(
-            evaluate_authorization(Some(&pkg), "laptop-1", now(), Some(now()), true),
+            evaluate_authorization(Some(&pkg), now(), Some(now()), true),
             AuthorizationState::Allowed
         );
     }
@@ -466,19 +414,15 @@ mod tests {
         let pkg = PolicyPackage::sign(sample_payload(1), &sk).unwrap();
 
         assert_eq!(
-            evaluate_authorization(None, "laptop-1", now(), Some(now()), true),
+            evaluate_authorization(None, now(), Some(now()), true),
             AuthorizationState::Denied(AuthorizationDenial::NoActivePolicy)
         );
         assert_eq!(
-            evaluate_authorization(Some(&pkg), "laptop-1", now(), Some(now()), false),
+            evaluate_authorization(Some(&pkg), now(), Some(now()), false),
             AuthorizationState::Denied(AuthorizationDenial::AuditUnhealthy)
         );
         assert_eq!(
-            evaluate_authorization(Some(&pkg), "other-laptop", now(), Some(now()), true),
-            AuthorizationState::Denied(AuthorizationDenial::DeviceMismatch)
-        );
-        assert_eq!(
-            evaluate_authorization(Some(&pkg), "laptop-1", now(), None, true),
+            evaluate_authorization(Some(&pkg), now(), None, true),
             AuthorizationState::Denied(AuthorizationDenial::TrustedTimeUnavailable)
         );
     }
@@ -487,18 +431,17 @@ mod tests {
     fn authorization_rejects_an_expired_policy_and_clock_rollback() {
         let (sk, _) = crypto::generate_keypair();
         let mut expired = sample_payload(1);
-        expired.effective_until = now() - Duration::seconds(1);
+        expired.expires_at = now() - Duration::seconds(1);
         let expired = PolicyPackage::sign(expired, &sk).unwrap();
         let current = PolicyPackage::sign(sample_payload(2), &sk).unwrap();
 
         assert_eq!(
-            evaluate_authorization(Some(&expired), "laptop-1", now(), Some(now()), true),
+            evaluate_authorization(Some(&expired), now(), Some(now()), true),
             AuthorizationState::Denied(AuthorizationDenial::Expired)
         );
         assert_eq!(
             evaluate_authorization(
                 Some(&current),
-                "laptop-1",
                 now(),
                 Some(now() + Duration::seconds(301)),
                 true,
@@ -508,14 +451,17 @@ mod tests {
     }
 
     #[test]
-    fn authorization_handles_an_extreme_rollback_tolerance() {
+    fn clock_rollback_within_the_tolerance_is_allowed() {
         let (sk, _) = crypto::generate_keypair();
-        let mut payload = sample_payload(1);
-        payload.clock_rollback_tolerance_secs = u64::MAX;
-        let pkg = PolicyPackage::sign(payload, &sk).unwrap();
+        let pkg = PolicyPackage::sign(sample_payload(1), &sk).unwrap();
 
         assert_eq!(
-            evaluate_authorization(Some(&pkg), "laptop-1", now(), Some(now()), true),
+            evaluate_authorization(
+                Some(&pkg),
+                now(),
+                Some(now() + Duration::seconds(CLOCK_ROLLBACK_TOLERANCE_SECS as i64)),
+                true,
+            ),
             AuthorizationState::Allowed
         );
     }

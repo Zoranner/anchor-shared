@@ -6,6 +6,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
+use uuid::Uuid;
 
 #[derive(Serialize)]
 struct ServiceConfig<'a> {
@@ -15,14 +16,16 @@ struct ServiceConfig<'a> {
 }
 
 /// 校验安装输入并原子写入服务配置，私钥不会经过该接口。
+///
+/// 未提供设备标识时沿用已有配置中的标识；首次安装也没有提供时生成一个本机标识。
 pub fn write_service_config(
     config_path: &Path,
     database_path: &Path,
-    device_id: &str,
+    device_id: Option<&str>,
     verifying_key_hex: &str,
 ) -> Result<()> {
-    validate_device_id(device_id)?;
     validate_verifying_key(verifying_key_hex)?;
+    let device_id = resolve_device_id(config_path, device_id)?;
     let parent = config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -32,7 +35,7 @@ pub fn write_service_config(
     let content = toml::to_string(&ServiceConfig {
         database: database_path,
         verifying_key_hex,
-        device_id,
+        device_id: &device_id,
     })?;
     let temporary_path = config_path.with_extension(format!(
         "{}.tmp",
@@ -53,6 +56,25 @@ pub fn write_service_config(
         return Err(error);
     }
     Ok(())
+}
+
+/// 设备标识优先使用显式输入，其次沿用已有配置，最后生成一个本机唯一标识。
+fn resolve_device_id(config_path: &Path, requested: Option<&str>) -> Result<String> {
+    if let Some(device_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        validate_device_id(device_id)?;
+        return Ok(device_id.to_string());
+    }
+    if let Some(existing) = existing_device_id(config_path) {
+        return Ok(existing);
+    }
+    Ok(format!("device-{}", Uuid::new_v4()))
+}
+
+fn existing_device_id(config_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(config_path).ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
+    let device_id = parsed.get("device_id")?.as_str()?.trim();
+    (!device_id.is_empty()).then(|| device_id.to_string())
 }
 
 fn validate_device_id(device_id: &str) -> Result<()> {

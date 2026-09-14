@@ -14,4 +14,5 @@ pub use policy::{
     decide_import, evaluate_authorization, ActionPolicy, AuthorizationDenial, AuthorizationState,
     BurningAllowRule, BurningRules, ImportDecision, NetworkAllowRule, NetworkRules, PolicyPackage,
     PolicyPayload, ScanRule, ScanRuleKind, ScanRules, UsbAllowRule, UsbRules,
+    CLOCK_ROLLBACK_TOLERANCE_SECS,
 };

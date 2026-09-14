@@ -14,15 +14,11 @@ fn now() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap()
 }
 
-fn package(device_id: &str, version: u64, key: &ed25519_dalek::SigningKey) -> PolicyPackage {
+fn package(version: u64, key: &ed25519_dalek::SigningKey) -> PolicyPackage {
     PolicyPackage::sign(
         PolicyPayload {
-            policy_id: "policy-laptop-1".into(),
             version,
-            device_id: device_id.into(),
-            effective_from: now() - Duration::hours(1),
-            effective_until: now() + Duration::days(1),
-            clock_rollback_tolerance_secs: 300,
+            expires_at: now() + Duration::days(1),
             usb: UsbRules {
                 read: ActionPolicy::Deny,
                 write: ActionPolicy::Deny,
@@ -52,7 +48,7 @@ fn valid_package_in_a_removable_root_restores_authorization() {
     let (signing_key, verifying_key) = crypto::generate_keypair();
     fs::write(
         root.path().join("anchor-guard.policy"),
-        serde_json::to_vec(&package("laptop-1", 1, &signing_key)).unwrap(),
+        serde_json::to_vec(&package(1, &signing_key)).unwrap(),
     )
     .unwrap();
     let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
@@ -69,34 +65,12 @@ fn valid_package_in_a_removable_root_restores_authorization() {
 }
 
 #[test]
-fn package_for_another_device_keeps_service_denied() {
-    let root = tempdir().unwrap();
-    let (signing_key, verifying_key) = crypto::generate_keypair();
-    fs::write(
-        root.path().join("anchor-guard.policy"),
-        serde_json::to_vec(&package("other-laptop", 1, &signing_key)).unwrap(),
-    )
-    .unwrap();
-    let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
-
-    assert!(
-        !service
-            .import_from_roots(&[root.path()], "alice", now())
-            .accepted
-    );
-    assert!(matches!(
-        service.authorization_state(now()),
-        AuthorizationState::Denied(_)
-    ));
-}
-
-#[test]
 fn authorization_remembers_the_latest_trusted_time_for_rollback_detection() {
     let root = tempdir().unwrap();
     let (signing_key, verifying_key) = crypto::generate_keypair();
     fs::write(
         root.path().join("anchor-guard.policy"),
-        serde_json::to_vec(&package("laptop-1", 1, &signing_key)).unwrap(),
+        serde_json::to_vec(&package(1, &signing_key)).unwrap(),
     )
     .unwrap();
     let service = Service::new(Store::in_memory().unwrap(), verifying_key, "laptop-1");
@@ -122,7 +96,7 @@ fn enforcement_failure_denies_authorization_until_a_policy_is_imported() {
     let store = Store::in_memory().unwrap();
     store
         .import_policy(
-            &package("laptop-1", 1, &signing_key),
+            &package(1, &signing_key),
             ImportDecision::Accept,
             "laptop-1",
             "alice",
@@ -156,7 +130,7 @@ fn enforcement_failure_denies_authorization_until_a_policy_is_imported() {
     let root = tempdir().unwrap();
     fs::write(
         root.path().join("anchor-guard.policy"),
-        serde_json::to_vec(&package("laptop-1", 2, &signing_key)).unwrap(),
+        serde_json::to_vec(&package(2, &signing_key)).unwrap(),
     )
     .unwrap();
     assert!(

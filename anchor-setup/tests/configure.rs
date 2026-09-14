@@ -11,7 +11,7 @@ fn writes_validated_service_config_without_leaving_a_temporary_file() {
     let config = directory.path().join("service.toml");
     let database = directory.path().join("audit.db");
 
-    write_service_config(&config, &database, "laptop-1", VERIFYING_KEY_HEX).unwrap();
+    write_service_config(&config, &database, Some("laptop-1"), VERIFYING_KEY_HEX).unwrap();
 
     let configured: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
     assert_eq!(
@@ -35,7 +35,7 @@ fn rejects_invalid_input_without_replacing_existing_config() {
     let error = write_service_config(
         &config,
         &directory.path().join("audit.db"),
-        "laptop\n1",
+        Some("laptop\n1"),
         VERIFYING_KEY_HEX,
     )
     .unwrap_err();
@@ -45,4 +45,22 @@ fn rejects_invalid_input_without_replacing_existing_config() {
         fs::read_to_string(&config).unwrap(),
         "previous configuration\n"
     );
+}
+
+#[test]
+fn generates_a_local_device_id_when_none_is_provided() {
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("service.toml");
+    let database = directory.path().join("audit.db");
+
+    write_service_config(&config, &database, None, VERIFYING_KEY_HEX).unwrap();
+
+    let configured: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let device_id = configured["device_id"].as_str().unwrap();
+    assert!(device_id.starts_with("device-"));
+
+    write_service_config(&config, &database, None, VERIFYING_KEY_HEX).unwrap();
+
+    let reconfigured: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(reconfigured["device_id"].as_str(), Some(device_id));
 }

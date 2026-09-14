@@ -6,12 +6,8 @@ use tempfile::tempdir;
 
 fn valid_config() -> &'static str {
     r#"
-policy_id = "policy-laptop-1"
 version = 1
-device_id = "laptop-1"
-effective_from = "2026-08-28T00:00:00Z"
-effective_until = "2026-09-28T00:00:00Z"
-clock_rollback_tolerance_secs = 300
+expires_at = "2026-09-28T00:00:00Z"
 
 [usb]
 read = "allow"
@@ -74,7 +70,7 @@ fn keygen_and_sign_produce_a_policy_package_verified_by_the_generated_public_key
             .trim(),
     )
     .unwrap();
-    assert_eq!(package.payload.device_id, "laptop-1");
+    assert_eq!(package.payload.version, 1);
     assert!(package.verify_signature(&public_key));
 }
 
@@ -104,28 +100,13 @@ fn sign_rejects_invalid_policy_configuration() {
     keygen(binary, &keys_dir);
 
     for (name, config) in [
-        ("empty-device", valid_config().replace("laptop-1", "")),
         (
-            "inverted-window",
-            valid_config().replace("2026-09-28T00:00:00Z", "2026-08-28T00:00:00Z"),
+            "unknown-field",
+            format!("unknown_key = 1\n{}", valid_config()),
         ),
         (
-            "negative-tolerance",
-            valid_config().replace(
-                "clock_rollback_tolerance_secs = 300",
-                "clock_rollback_tolerance_secs = -1",
-            ),
-        ),
-        (
-            "empty-scan-dirs",
-            valid_config().replace(
-                "controlled_dirs = [\"D:\\\\workspace\"]",
-                "controlled_dirs = []",
-            ),
-        ),
-        (
-            "no-allow-rule",
-            valid_config().replace("read = \"allow\"", "read = \"deny\""),
+            "invalid-expiry",
+            valid_config().replace("2026-09-28T00:00:00Z", "not-a-timestamp"),
         ),
         (
             "network-allow-without-object",
@@ -175,11 +156,7 @@ fn documented_policy_example_can_be_signed() {
     let binary = env!("CARGO_BIN_EXE_anchor-policy");
     let keys_dir = temp.path().join("keys");
     let policy_path = temp.path().join("anchor-guard.policy");
-    let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("docs")
-        .join("policy-example.toml");
+    let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy-example.toml");
     keygen(binary, &keys_dir);
 
     let status = Command::new(binary)
@@ -194,4 +171,52 @@ fn documented_policy_example_can_be_signed() {
 
     assert!(status.success());
     assert!(policy_path.is_file());
+}
+
+#[test]
+fn default_deny_policy_needs_no_device_identifiers() {
+    let temp = tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_anchor-policy");
+    let keys_dir = temp.path().join("keys");
+    let config_path = temp.path().join("deny-all.toml");
+    let policy_path = temp.path().join("anchor-guard.policy");
+    keygen(binary, &keys_dir);
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+expires_at = "2026-09-28T00:00:00Z"
+
+[usb]
+read = "deny"
+write = "deny"
+
+[network]
+policy = "deny"
+
+[burning]
+policy = "deny"
+
+[scan]
+controlled_dirs = []
+"#,
+    )
+    .unwrap();
+
+    let status = Command::new(binary)
+        .args(["sign", "--key"])
+        .arg(keys_dir.join("signing-key.hex"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["--out"])
+        .arg(&policy_path)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let package: PolicyPackage = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    assert!(package.payload.usb.allowed.is_empty());
+    assert!(package.payload.network.allowed.is_empty());
+    assert!(package.payload.burning.allowed.is_empty());
+    assert!(package.payload.scan.controlled_dirs.is_empty());
 }

@@ -253,12 +253,8 @@ mod tests {
     fn service(directory: &Path) -> Service {
         let policy = PolicyPackage::sign(
             PolicyPayload {
-                policy_id: "p1".into(),
                 version: 1,
-                device_id: "laptop-1".into(),
-                effective_from: now() - Duration::hours(1),
-                effective_until: now() + Duration::days(1),
-                clock_rollback_tolerance_secs: 300,
+                expires_at: now() + Duration::days(1),
                 usb: UsbRules {
                     read: ActionPolicy::Deny,
                     write: ActionPolicy::Deny,

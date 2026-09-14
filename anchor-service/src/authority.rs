@@ -99,13 +99,8 @@ impl Service {
             }
         };
 
-        let authorization = evaluate_authorization(
-            active_policy.as_ref(),
-            &self.device_id,
-            now,
-            last_trusted_at,
-            audit_healthy,
-        );
+        let authorization =
+            evaluate_authorization(active_policy.as_ref(), now, last_trusted_at, audit_healthy);
         if authorization == AuthorizationState::Allowed
             && self.store.record_trusted_time(now).is_err()
         {
@@ -235,13 +230,7 @@ impl Service {
                 Ok(package) => package.map(|package| package.payload.version),
                 Err(_) => return ImportOutcome::denied("store_unavailable"),
             };
-            let decision = decide_import(
-                &package,
-                &self.verifying_key,
-                &self.device_id,
-                current_version,
-                now,
-            );
+            let decision = decide_import(&package, &self.verifying_key, current_version, now);
             if self
                 .store
                 .import_policy(&package, decision, &self.device_id, user, now)
@@ -305,9 +294,8 @@ fn import_rejection_reason(decision: ImportDecision) -> &'static str {
     match decision {
         ImportDecision::Accept => "accepted",
         ImportDecision::InvalidSignature => "invalid_signature",
-        ImportDecision::DeviceMismatch => "device_mismatch",
         ImportDecision::VersionNotNewer => "version_not_newer",
-        ImportDecision::OutsideEffectiveWindow => "outside_effective_window",
+        ImportDecision::Expired => "expired",
     }
 }
 
@@ -317,8 +305,6 @@ fn authorization_response(state: AuthorizationState) -> AuthorizationResponse {
         AuthorizationState::Denied(reason) => AuthorizationResponse::Denied {
             reason: match reason {
                 AuthorizationDenial::NoActivePolicy => "no_active_policy",
-                AuthorizationDenial::DeviceMismatch => "device_mismatch",
-                AuthorizationDenial::NotYetEffective => "not_yet_effective",
                 AuthorizationDenial::Expired => "expired",
                 AuthorizationDenial::TrustedTimeUnavailable => "trusted_time_unavailable",
                 AuthorizationDenial::ClockRollback => "clock_rollback",

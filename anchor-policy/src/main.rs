@@ -37,13 +37,10 @@ enum Command {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyConfig {
-    policy_id: String,
     version: u64,
-    device_id: String,
-    effective_from: String,
-    effective_until: String,
-    clock_rollback_tolerance_secs: i64,
+    expires_at: String,
     usb: UsbRules,
     network: NetworkRules,
     burning: BurningRules,
@@ -52,36 +49,13 @@ struct PolicyConfig {
 
 impl PolicyConfig {
     fn into_payload(self) -> Result<PolicyPayload> {
-        if self.policy_id.trim().is_empty() {
-            bail!("policy_id 不能为空");
-        }
-        if self.device_id.trim().is_empty() {
-            bail!("device_id 不能为空");
-        }
-        if self.clock_rollback_tolerance_secs < 0 {
-            bail!("clock_rollback_tolerance_secs 不能为负数");
-        }
-        if self.scan.controlled_dirs.is_empty() {
-            bail!("scan.controlled_dirs 不能为空");
-        }
         validate_allowed_objects(&self.usb, &self.network, &self.burning)?;
-        if !has_allow_rule(&self.usb, &self.network, &self.burning) {
-            bail!("策略至少需要一条明确允许的受控设备规则");
-        }
 
-        let effective_from = parse_time(&self.effective_from, "effective_from")?;
-        let effective_until = parse_time(&self.effective_until, "effective_until")?;
-        if effective_until <= effective_from {
-            bail!("effective_until 必须晚于 effective_from");
-        }
+        let expires_at = parse_time(&self.expires_at, "expires_at")?;
 
         Ok(PolicyPayload {
-            policy_id: self.policy_id,
             version: self.version,
-            device_id: self.device_id,
-            effective_from,
-            effective_until,
-            clock_rollback_tolerance_secs: self.clock_rollback_tolerance_secs as u64,
+            expires_at,
             usb: self.usb,
             network: self.network,
             burning: self.burning,
@@ -150,13 +124,6 @@ fn parse_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("{field} 不是 RFC 3339 时间"))?
         .with_timezone(&Utc))
-}
-
-fn has_allow_rule(usb: &UsbRules, network: &NetworkRules, burning: &BurningRules) -> bool {
-    (matches!(usb.read, ActionPolicy::Allow) || matches!(usb.write, ActionPolicy::Allow))
-        && !usb.allowed.is_empty()
-        || matches!(network.policy, ActionPolicy::Allow) && !network.allowed.is_empty()
-        || matches!(burning.policy, ActionPolicy::Allow) && !burning.allowed.is_empty()
 }
 
 fn validate_allowed_objects(
