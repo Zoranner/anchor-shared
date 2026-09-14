@@ -1,26 +1,37 @@
-//! 活动策略的会话与设备处置编排。
+//! 活动策略的授权结论与设备差异处置编排。
 //!
-//! 本模块只接收已观测的设备并生成处置计划；真实 Windows 枚举和设备控制属于
-//! `anchor-system` 的独立边界。
+//! 本模块只接收已观测的设备并下发与策略不一致的处置：观测状态已经符合策略的设备不会
+//! 被重复处置，也不会重复写审计。真实 Windows 枚举和设备控制属于 `anchor-system`。
 
-use anchor_core::{ActionPolicy, AuditPayload, AuthorizationDenial, AuthorizationState, EventType};
+use anchor_core::{
+    ActionPolicy, AuditPayload, AuthorizationDenial, AuthorizationState, BurningRules, EventType,
+    NetworkRules, UsbRules,
+};
 use anchor_store::StoreError;
 use anchor_system::{
-    burning::{apply_burning_control, BurnDriveInfo, BurningControlExecutor},
+    burning::{BurnDriveInfo, BurningControlExecutor},
     error::PlatformError,
     inventory::DeviceInventory,
-    nic::{apply_nic_control, NicControlExecutor, NicInfo},
-    session::SessionLocker,
+    nic::{NicControlExecutor, NicInfo},
     usb::{
-        apply_usb_storage_control, plan_usb_storage_control, UsbAllowRule, UsbControlResult,
-        UsbStorageDevice, UsbStorageExecutor,
+        plan_usb_storage_control, UsbAllowRule, UsbPlannedAction, UsbStorageDevice,
+        UsbStorageExecutor,
     },
 };
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::Service;
+
+/// 设备状态类别：USB 大容量存储。
+const USB_STATE_KIND: &str = "usb";
+/// 设备状态类别：网卡。
+const NIC_STATE_KIND: &str = "nic";
+/// 设备状态类别：刻录光驱。
+const BURNING_STATE_KIND: &str = "burning";
+/// 设备库存观测失败的运行期原因。
+const INVENTORY_FAILURE_REASON: &str = "inventory_observation_failed";
 
 /// 服务本轮已观测到的受控设备。调用方负责观测，本模块不枚举设备。
 #[derive(Debug, Default)]
@@ -40,67 +51,57 @@ impl From<DeviceInventory> for ObservedDevices {
     }
 }
 
-/// 网卡的计划处置。
+/// 已按策略差异下发的 USB 大容量存储处置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbDisposition {
+    pub instance_id: String,
+    pub enabled: bool,
+}
+
+/// 已按策略差异下发的网卡处置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NicDisposition {
     pub adapter_id: String,
     pub enabled: bool,
 }
 
-/// 刻录光驱的计划处置。
+/// 已按策略差异下发的刻录光驱处置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BurningDisposition {
     pub drive_id: String,
     pub enabled: bool,
 }
 
-/// 本轮设备计划，尚未调用任何设备控制 API。
-#[derive(Debug, Default)]
-pub struct DevicePlans {
-    pub usb: Vec<UsbControlResult>,
+/// 本轮实际下发的设备处置；观测状态已符合策略的设备不会出现。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AppliedDispositions {
+    pub usb: Vec<UsbDisposition>,
     pub adapters: Vec<NicDisposition>,
     pub burn_drives: Vec<BurningDisposition>,
 }
 
 /// 策略编排的可观察结论。
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EnforcementOutcome {
-    SessionLocked { reason: AuthorizationDenial },
-    DevicePlans(DevicePlans),
+    Denied { reason: AuthorizationDenial },
+    Reconciled(AppliedDispositions),
 }
 
-/// 编排时的存储或锁屏失败。
+/// 编排时的存储或设备控制失败。
 #[derive(Debug, Error)]
 pub enum EnforcementError {
     #[error("本地状态或审计写入失败: {0}")]
     Store(#[from] StoreError),
-    #[error("锁定当前会话失败: {0}")]
-    SessionLock(#[from] PlatformError),
     #[error("设备控制执行失败: {0}")]
     DeviceControl(PlatformError),
-    #[error("设备控制与后续会话锁定均失败: 设备={device}; 锁定={session}")]
-    DeviceControlAndSessionLock {
-        device: PlatformError,
-        session: PlatformError,
-    },
     #[error("设备处置后的审计或状态持久化失败: {0}")]
     StatePersistence(StoreError),
-    #[error("设备处置后的状态持久化与会话锁定均失败: 状态={state}; 锁定={session}")]
-    StatePersistenceAndSessionLock {
-        state: StoreError,
-        session: PlatformError,
-    },
 }
 
+/// 单台设备处置失败的原因；失败不中断其余设备的处置。
 enum ExecutionFailure {
     DeviceControl(PlatformError),
     StatePersistence(StoreError),
-}
-
-struct DeviceStateUpdate<'a> {
-    kind: &'a str,
-    device_id: &'a str,
-    state: &'a serde_json::Value,
 }
 
 impl ExecutionFailure {
@@ -110,68 +111,61 @@ impl ExecutionFailure {
             Self::StatePersistence(error) => EnforcementError::StatePersistence(error),
         }
     }
+}
 
-    fn with_session_lock_error(self, session: PlatformError) -> EnforcementError {
-        match self {
-            Self::DeviceControl(device) => {
-                EnforcementError::DeviceControlAndSessionLock { device, session }
-            }
-            Self::StatePersistence(state) => {
-                EnforcementError::StatePersistenceAndSessionLock { state, session }
-            }
-        }
+fn remember_failure(slot: &mut Option<ExecutionFailure>, failure: ExecutionFailure) {
+    if slot.is_none() {
+        *slot = Some(failure);
+    }
+}
+
+fn authorization_denial_reason(reason: AuthorizationDenial) -> &'static str {
+    match reason {
+        AuthorizationDenial::NoActivePolicy => "no_active_policy",
+        AuthorizationDenial::Expired => "expired",
+        AuthorizationDenial::ClockRollback => "clock_rollback",
+        AuthorizationDenial::AuditUnhealthy => "audit_unhealthy",
+        AuthorizationDenial::TrustedTimeUnavailable => "trusted_time_unavailable",
+        AuthorizationDenial::EnforcementUnhealthy => "enforcement_unhealthy",
+    }
+}
+
+fn execution_failure_reason(failure: &ExecutionFailure) -> &'static str {
+    match failure {
+        ExecutionFailure::DeviceControl(_) => "device_control_failed",
+        ExecutionFailure::StatePersistence(_) => "state_persistence_failed",
     }
 }
 
 impl Service {
-    /// 记录库存观测失败并进入运行期 fail-closed 状态。
+    /// 记录库存观测失败并进入运行期 fail-closed 状态；同一原因只记录一次。
     pub fn record_inventory_failure(
         &self,
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let mut event = AuditPayload::new(
-            &self.device_id,
-            "AnchorGuard",
+        if self.store.enforcement_failure()?.as_deref() == Some(INVENTORY_FAILURE_REASON) {
+            return Ok(());
+        }
+        let mut event = self.audit_payload(
             EventType::InventoryObservationFailed,
             "observe_inventory",
             "failed",
-        );
-        event.timestamp = now;
-        event.resource = Some(reason.into());
-        self.store.append_audit_and_set_enforcement_failure(
-            event,
-            "inventory_observation_failed",
+            None,
             now,
-        )
+        );
+        event.resource = Some(reason.into());
+        self.store
+            .append_audit_and_set_enforcement_failure(event, INVENTORY_FAILURE_REASON, now)
     }
 
-    /// 根据当前活动策略处理已观测设备。
+    /// 按当前授权结论和活动策略处置已观测设备。
     ///
-    /// 授权拒绝时立即请求锁定会话并写入审计。授权允许时，仅根据明确 allowlist
-    /// 生成设备启用计划；未列入 allowlist 的 USB、网卡和光驱均保持默认拒绝。
-    pub fn apply_policy<L>(
+    /// 授权拒绝时只记录一次拒绝结论；锁定交互会话由该会话内的协作程序负责，服务运行在
+    /// Session 0，不调用锁屏 API。授权允许时，只对观测状态与策略期望不一致的设备下发
+    /// 处置，并只为这些设备写入审计事件。
+    pub fn enforce_policy<U, N, B>(
         &self,
-        locker: &L,
-        observed: ObservedDevices,
-        now: DateTime<Utc>,
-    ) -> Result<EnforcementOutcome, EnforcementError>
-    where
-        L: SessionLocker,
-    {
-        match self.authorization_state(now) {
-            AuthorizationState::Denied(reason) => self.lock_denied_session(locker, reason, now),
-            AuthorizationState::Allowed => self.plan_allowed_devices(observed, now),
-        }
-    }
-
-    /// 执行活动策略的设备计划。
-    ///
-    /// 调用方显式提供三类执行器，使服务循环和测试环境不会隐式调用真实 Windows
-    /// 控制 API。设备状态和成功审计仅在对应执行器成功后写入。
-    pub fn enforce_policy<L, U, N, B>(
-        &self,
-        locker: &L,
         usb_executor: &mut U,
         nic_executor: &mut N,
         burning_executor: &mut B,
@@ -179,437 +173,421 @@ impl Service {
         now: DateTime<Utc>,
     ) -> Result<EnforcementOutcome, EnforcementError>
     where
-        L: SessionLocker,
         U: UsbStorageExecutor,
         N: NicControlExecutor,
         B: BurningControlExecutor,
     {
-        let outcome = match self.authorization_state_for_enforcement(now) {
-            AuthorizationState::Denied(reason) => self.lock_denied_session(locker, reason, now)?,
-            AuthorizationState::Allowed => self.plan_allowed_devices(observed, now)?,
-        };
-        let EnforcementOutcome::DevicePlans(plans) = outcome else {
-            return Ok(outcome);
-        };
-        let active_policy = self
-            .store
-            .active_policy()?
-            .expect("allowed authorization requires an active policy");
-        let policy_version = active_policy.payload.version;
-        let allowed_nics: Vec<String> =
-            if active_policy.payload.network.policy == ActionPolicy::Allow {
-                active_policy
-                    .payload
-                    .network
-                    .allowed
-                    .iter()
-                    .map(|rule| rule.adapter_id.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let allowed_burn_drives: Vec<String> =
-            if active_policy.payload.burning.policy == ActionPolicy::Allow {
-                active_policy
-                    .payload
-                    .burning
-                    .allowed
-                    .iter()
-                    .map(|rule| rule.drive_id.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        let mut first_failure = None;
-
-        for plan in &plans.usb {
-            if let Err(error) = apply_usb_storage_control(usb_executor, plan.clone()) {
-                let failure = ExecutionFailure::DeviceControl(error);
-                let persistence = self.record_execution_failure(
-                    EventType::UsbAttach,
-                    "apply_usb_control",
-                    &plan.device.instance_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-                continue;
-            }
-            if let Err(error) = self.persist_usb_plan(plan, policy_version, now) {
-                let failure = ExecutionFailure::StatePersistence(error);
-                let persistence = self.record_execution_failure(
-                    EventType::UsbAttach,
-                    "persist_usb_control",
-                    &plan.device.instance_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-            }
+        if let AuthorizationState::Denied(reason) = self.authorization_state_for_enforcement(now) {
+            self.record_denial_once(reason, now)?;
+            return Ok(EnforcementOutcome::Denied { reason });
         }
+        self.clear_denial_once()?;
 
-        for plan in &plans.adapters {
-            if let Err(error) =
-                apply_nic_control(nic_executor, &plan.adapter_id, plan.enabled, &allowed_nics)
-            {
-                let failure = ExecutionFailure::DeviceControl(error);
-                let persistence = self.record_execution_failure(
-                    EventType::NicChange,
-                    "apply_nic_control",
-                    &plan.adapter_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-                continue;
-            }
-            if let Err(error) = self.persist_nic_plan(plan, policy_version, now) {
-                let failure = ExecutionFailure::StatePersistence(error);
-                let persistence = self.record_execution_failure(
-                    EventType::NicChange,
-                    "persist_nic_control",
-                    &plan.adapter_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-            }
-        }
-
-        for plan in &plans.burn_drives {
-            if let Err(error) = apply_burning_control(
-                burning_executor,
-                &plan.drive_id,
-                plan.enabled,
-                &allowed_burn_drives,
-            ) {
-                let failure = ExecutionFailure::DeviceControl(error);
-                let persistence = self.record_execution_failure(
-                    EventType::BurnTask,
-                    "apply_burning_control",
-                    &plan.drive_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-                continue;
-            }
-            if let Err(error) = self.persist_burning_plan(plan, policy_version, now) {
-                let failure = ExecutionFailure::StatePersistence(error);
-                let persistence = self.record_execution_failure(
-                    EventType::BurnTask,
-                    "persist_burning_control",
-                    &plan.drive_id,
-                    policy_version,
-                    &failure,
-                    now,
-                );
-                remember_persisted_execution_failure(&mut first_failure, persistence, failure);
-            }
-        }
-
-        if let Some(failure) = first_failure {
-            return match self.lock_after_device_control_failure(locker, now) {
-                Ok(()) => Err(failure.into_error()),
-                Err(EnforcementError::SessionLock(session)) => {
-                    Err(failure.with_session_lock_error(session))
-                }
-                Err(error) => Err(error),
-            };
-        }
-
-        if let Err(error) = self.store.clear_enforcement_failure() {
-            let failure = ExecutionFailure::StatePersistence(error);
-            return match self.lock_after_device_control_failure(locker, now) {
-                Ok(()) => Err(failure.into_error()),
-                Err(EnforcementError::SessionLock(session)) => {
-                    Err(failure.with_session_lock_error(session))
-                }
-                Err(error) => Err(error),
-            };
-        }
-
-        Ok(EnforcementOutcome::DevicePlans(plans))
-    }
-
-    fn lock_denied_session<L>(
-        &self,
-        locker: &L,
-        reason: AuthorizationDenial,
-        now: DateTime<Utc>,
-    ) -> Result<EnforcementOutcome, EnforcementError>
-    where
-        L: SessionLocker,
-    {
-        let lock_result = locker.lock_current_session();
-        self.append_enforcement_audit(
-            EventType::AuthorizationDenied,
-            "authorization",
-            authorization_denial_reason(reason),
-            None,
-            now,
-        )?;
-
-        match lock_result {
-            Ok(_) => {
-                self.append_enforcement_audit(
-                    EventType::SessionLocked,
-                    "lock_session",
-                    "locked",
-                    None,
-                    now,
-                )?;
-                Ok(EnforcementOutcome::SessionLocked { reason })
-            }
-            Err(error) => {
-                self.append_enforcement_audit(
-                    EventType::SessionAssistantFailed,
-                    "lock_session",
-                    "failed",
-                    None,
-                    now,
-                )?;
-                Err(EnforcementError::SessionLock(error))
-            }
-        }
-    }
-
-    fn plan_allowed_devices(
-        &self,
-        observed: ObservedDevices,
-        _now: DateTime<Utc>,
-    ) -> Result<EnforcementOutcome, EnforcementError> {
         let active_policy = self
             .store
             .active_policy()?
             .expect("allowed authorization requires an active policy");
         let policy = &active_policy.payload;
-        let mut plans = DevicePlans::default();
+        let policy_version = policy.version;
 
-        let usb_allowlist: Vec<UsbAllowRule> =
-            if policy.usb.read == ActionPolicy::Allow && policy.usb.write == ActionPolicy::Allow {
-                policy
-                    .usb
-                    .allowed
-                    .iter()
-                    .map(|rule| UsbAllowRule {
-                        instance_id: rule.instance_id.clone(),
-                        vendor_id: rule.vendor_id.clone(),
-                        product_id: rule.product_id.clone(),
-                        serial: rule.serial.clone(),
-                    })
-                    .collect()
+        let mut applied = AppliedDispositions::default();
+        let mut failure = None;
+
+        let (usb, usb_failure) = self.reconcile_usb_storage(
+            usb_executor,
+            &policy.usb,
+            &observed.usb_storage,
+            policy_version,
+            now,
+        )?;
+        applied.usb = usb;
+        failure = failure.or(usb_failure);
+
+        let (adapters, nic_failure) = self.reconcile_network(
+            nic_executor,
+            &policy.network,
+            &observed.adapters,
+            policy_version,
+            now,
+        )?;
+        applied.adapters = adapters;
+        failure = failure.or(nic_failure);
+
+        let (burn_drives, burning_failure) = self.reconcile_burning(
+            burning_executor,
+            &policy.burning,
+            &observed.burn_drives,
+            policy_version,
+            now,
+        )?;
+        applied.burn_drives = burn_drives;
+        failure = failure.or(burning_failure);
+
+        match failure {
+            Some(failure) => Err(failure.into_error()),
+            None => {
+                self.store.clear_enforcement_failure()?;
+                Ok(EnforcementOutcome::Reconciled(applied))
+            }
+        }
+    }
+
+    /// 记录授权拒绝；相同原因连续出现时只保留一次审计。
+    fn record_denial_once(
+        &self,
+        reason: AuthorizationDenial,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let reason = authorization_denial_reason(reason);
+        if self.store.authorization_denial()?.as_deref() == Some(reason) {
+            return Ok(());
+        }
+        let event = self.audit_payload(
+            EventType::AuthorizationDenied,
+            "authorization",
+            reason,
+            None,
+            now,
+        );
+        self.store
+            .append_audit_and_set_authorization_denial(event, reason, now)
+    }
+
+    /// 授权恢复后清除已记录的拒绝原因，使下一次拒绝重新进入审计。
+    fn clear_denial_once(&self) -> Result<(), StoreError> {
+        if self.store.authorization_denial()?.is_some() {
+            self.store.clear_authorization_denial()?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_usb_storage<U>(
+        &self,
+        executor: &mut U,
+        rules: &UsbRules,
+        observed: &[UsbStorageDevice],
+        policy_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<UsbDisposition>, Option<ExecutionFailure>), StoreError>
+    where
+        U: UsbStorageExecutor,
+    {
+        let allowlist = usb_allowlist(rules);
+        let recorded = self.store.device_states(USB_STATE_KIND)?;
+        let mut applied = Vec::new();
+        let mut failure = None;
+        let mut present = Vec::new();
+
+        for device in observed {
+            let plan = plan_usb_storage_control(device.clone(), &allowlist);
+            if plan.planned_action == UsbPlannedAction::RejectNonMassStorage {
+                continue;
+            }
+            let instance_id = plan.device.instance_id.clone();
+            present.push(instance_id.clone());
+            let desired_enabled = plan.planned_action == UsbPlannedAction::EnableMassStorage;
+
+            if !recorded
+                .iter()
+                .any(|record| record.device_id == instance_id)
+            {
+                let event =
+                    self.audit_payload(EventType::UsbAttach, "usb_presence", "attached", None, now);
+                let state = usb_state(device, device.enabled);
+                if let Err(error) = self.store.append_audit_and_upsert_device_state(
+                    event,
+                    USB_STATE_KIND,
+                    &instance_id,
+                    &state,
+                    now,
+                ) {
+                    let recorded_failure = self.note_execution_failure(
+                        ExecutionFailure::StatePersistence(error),
+                        EventType::UsbAttach,
+                        "persist_usb_control",
+                        &instance_id,
+                        policy_version,
+                        now,
+                    );
+                    remember_failure(&mut failure, recorded_failure);
+                }
+            }
+
+            if device.enabled == desired_enabled {
+                continue;
+            }
+
+            if let Err(error) = executor.set_mass_storage_enabled(&instance_id, desired_enabled) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::DeviceControl(error),
+                    EventType::UsbAttach,
+                    "apply_usb_control",
+                    &instance_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+                continue;
+            }
+
+            let result = if desired_enabled {
+                "enabled"
             } else {
-                Vec::new()
+                "disabled"
             };
-        for device in observed.usb_storage {
-            let plan = plan_usb_storage_control(device, &usb_allowlist);
-            plans.usb.push(plan);
+            let event = self.audit_payload(
+                EventType::UsbAttach,
+                "apply_usb_control",
+                result,
+                Some((&instance_id, policy_version)),
+                now,
+            );
+            let state = usb_state(device, desired_enabled);
+            applied.push(UsbDisposition {
+                instance_id: instance_id.clone(),
+                enabled: desired_enabled,
+            });
+            if let Err(error) = self.store.append_audit_and_upsert_device_state(
+                event,
+                USB_STATE_KIND,
+                &instance_id,
+                &state,
+                now,
+            ) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::StatePersistence(error),
+                    EventType::UsbAttach,
+                    "persist_usb_control",
+                    &instance_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+            }
         }
 
-        for adapter in observed.adapters {
-            let enabled = policy.network.policy == ActionPolicy::Allow
-                && policy
-                    .network
+        for record in &recorded {
+            if present
+                .iter()
+                .any(|device_id| device_id == &record.device_id)
+            {
+                continue;
+            }
+            if record.state.get("enabled").and_then(Value::as_bool) == Some(true) {
+                let event =
+                    self.audit_payload(EventType::UsbRemove, "usb_presence", "removed", None, now);
+                if let Err(error) = self.store.append_audit(event) {
+                    let recorded_failure = self.note_execution_failure(
+                        ExecutionFailure::StatePersistence(error),
+                        EventType::UsbRemove,
+                        "persist_usb_control",
+                        &record.device_id,
+                        policy_version,
+                        now,
+                    );
+                    remember_failure(&mut failure, recorded_failure);
+                }
+            }
+            if let Err(error) = self
+                .store
+                .delete_device_state(USB_STATE_KIND, &record.device_id)
+            {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::StatePersistence(error),
+                    EventType::UsbRemove,
+                    "persist_usb_control",
+                    &record.device_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+            }
+        }
+
+        Ok((applied, failure))
+    }
+
+    fn reconcile_network<N>(
+        &self,
+        executor: &mut N,
+        rules: &NetworkRules,
+        observed: &[NicInfo],
+        policy_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<NicDisposition>, Option<ExecutionFailure>), StoreError>
+    where
+        N: NicControlExecutor,
+    {
+        let mut applied = Vec::new();
+        let mut failure = None;
+
+        for adapter in observed {
+            let desired_enabled = rules.policy == ActionPolicy::Allow
+                && rules
                     .allowed
                     .iter()
                     .any(|rule| rule.adapter_id == adapter.adapter_id);
-            let plan = NicDisposition {
-                adapter_id: adapter.adapter_id.clone(),
-                enabled,
+            if adapter.enabled == desired_enabled {
+                continue;
+            }
+
+            if let Err(error) = executor.set_enabled(&adapter.adapter_id, desired_enabled) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::DeviceControl(error),
+                    EventType::NicChange,
+                    "apply_nic_control",
+                    &adapter.adapter_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+                continue;
+            }
+
+            let result = if desired_enabled {
+                "enabled"
+            } else {
+                "disabled"
             };
-            plans.adapters.push(plan);
+            let event = self.audit_payload(
+                EventType::NicChange,
+                "apply_nic_control",
+                result,
+                Some((&adapter.adapter_id, policy_version)),
+                now,
+            );
+            applied.push(NicDisposition {
+                adapter_id: adapter.adapter_id.clone(),
+                enabled: desired_enabled,
+            });
+            if let Err(error) = self.store.append_audit_and_upsert_device_state(
+                event,
+                NIC_STATE_KIND,
+                &adapter.adapter_id,
+                &json!({ "planned_enabled": desired_enabled }),
+                now,
+            ) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::StatePersistence(error),
+                    EventType::NicChange,
+                    "persist_nic_control",
+                    &adapter.adapter_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+            }
         }
 
-        for drive in observed.burn_drives {
-            let enabled = policy.burning.policy == ActionPolicy::Allow
-                && policy
-                    .burning
+        Ok((applied, failure))
+    }
+
+    fn reconcile_burning<B>(
+        &self,
+        executor: &mut B,
+        rules: &BurningRules,
+        observed: &[BurnDriveInfo],
+        policy_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<BurningDisposition>, Option<ExecutionFailure>), StoreError>
+    where
+        B: BurningControlExecutor,
+    {
+        let mut applied = Vec::new();
+        let mut failure = None;
+
+        for drive in observed {
+            let desired_enabled = rules.policy == ActionPolicy::Allow
+                && rules
                     .allowed
                     .iter()
                     .any(|rule| rule.drive_id == drive.drive_id);
-            let plan = BurningDisposition {
-                drive_id: drive.drive_id.clone(),
-                enabled,
+            if drive.enabled == desired_enabled {
+                continue;
+            }
+
+            if let Err(error) = executor.set_enabled(&drive.drive_id, desired_enabled) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::DeviceControl(error),
+                    EventType::BurnTask,
+                    "apply_burning_control",
+                    &drive.drive_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+                continue;
+            }
+
+            let result = if desired_enabled {
+                "enabled"
+            } else {
+                "disabled"
             };
-            plans.burn_drives.push(plan);
+            let event = self.audit_payload(
+                EventType::BurnTask,
+                "apply_burning_control",
+                result,
+                Some((&drive.drive_id, policy_version)),
+                now,
+            );
+            applied.push(BurningDisposition {
+                drive_id: drive.drive_id.clone(),
+                enabled: desired_enabled,
+            });
+            if let Err(error) = self.store.append_audit_and_upsert_device_state(
+                event,
+                BURNING_STATE_KIND,
+                &drive.drive_id,
+                &json!({ "planned_enabled": desired_enabled }),
+                now,
+            ) {
+                let recorded_failure = self.note_execution_failure(
+                    ExecutionFailure::StatePersistence(error),
+                    EventType::BurnTask,
+                    "persist_burning_control",
+                    &drive.drive_id,
+                    policy_version,
+                    now,
+                );
+                remember_failure(&mut failure, recorded_failure);
+            }
         }
 
-        Ok(EnforcementOutcome::DevicePlans(plans))
+        Ok((applied, failure))
     }
 
-    fn persist_usb_plan(
+    /// 记录处置失败并进入 fail-closed 状态；同一原因连续失败时不再重复写审计。
+    fn note_execution_failure(
         &self,
-        plan: &UsbControlResult,
-        policy_version: u64,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        let result = format!("{:?}", plan.planned_action).to_lowercase();
-        let state = json!({
-            "vendor_id": plan.device.vendor_id,
-            "product_id": plan.device.product_id,
-            "serial": plan.device.serial,
-            "matched_rule": plan.matched_rule,
-            "planned_action": result,
-        });
-        self.append_enforcement_audit_and_state(
-            EventType::UsbAttach,
-            "plan_usb_control",
-            &result,
-            Some((&plan.device.instance_id, policy_version)),
-            DeviceStateUpdate {
-                kind: "usb",
-                device_id: &plan.device.instance_id,
-                state: &state,
-            },
-            now,
-        )
-    }
-
-    fn record_execution_failure(
-        &self,
+        failure: ExecutionFailure,
         event_type: EventType,
         action: &str,
         resource: &str,
         policy_version: u64,
-        failure: &ExecutionFailure,
         now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        self.store.append_audit_and_set_enforcement_failure(
-            self.enforcement_audit_payload(
-                event_type,
-                action,
-                "failed",
-                Some((resource, policy_version)),
-                now,
-            ),
-            execution_failure_reason(failure),
+    ) -> ExecutionFailure {
+        let reason = execution_failure_reason(&failure);
+        if self.store.enforcement_failure().ok().flatten().as_deref() == Some(reason) {
+            return failure;
+        }
+        let event = self.audit_payload(
+            event_type,
+            action,
+            "failed",
+            Some((resource, policy_version)),
             now,
-        )
-    }
-
-    fn lock_after_device_control_failure<L>(
-        &self,
-        locker: &L,
-        now: DateTime<Utc>,
-    ) -> Result<(), EnforcementError>
-    where
-        L: SessionLocker,
-    {
-        match locker.lock_current_session() {
-            Ok(_) => {
-                self.append_enforcement_audit(
-                    EventType::SessionLocked,
-                    "lock_session",
-                    "device_control_failed",
-                    None,
-                    now,
-                )?;
-                Ok(())
-            }
-            Err(error) => {
-                self.append_enforcement_audit(
-                    EventType::SessionAssistantFailed,
-                    "lock_session",
-                    "device_control_failed",
-                    None,
-                    now,
-                )?;
-                Err(EnforcementError::SessionLock(error))
-            }
+        );
+        match self
+            .store
+            .append_audit_and_set_enforcement_failure(event, reason, now)
+        {
+            Ok(()) => failure,
+            Err(error) => ExecutionFailure::StatePersistence(error),
         }
     }
 
-    fn persist_nic_plan(
-        &self,
-        plan: &NicDisposition,
-        policy_version: u64,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        let result = if plan.enabled { "enable" } else { "disable" };
-        let state = json!({
-            "planned_enabled": plan.enabled,
-        });
-        self.append_enforcement_audit_and_state(
-            EventType::NicChange,
-            "plan_nic_control",
-            result,
-            Some((&plan.adapter_id, policy_version)),
-            DeviceStateUpdate {
-                kind: "nic",
-                device_id: &plan.adapter_id,
-                state: &state,
-            },
-            now,
-        )
-    }
-
-    fn persist_burning_plan(
-        &self,
-        plan: &BurningDisposition,
-        policy_version: u64,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        let result = if plan.enabled { "enable" } else { "disable" };
-        let state = json!({
-            "planned_enabled": plan.enabled,
-        });
-        self.append_enforcement_audit_and_state(
-            EventType::BurnTask,
-            "plan_burning_control",
-            result,
-            Some((&plan.drive_id, policy_version)),
-            DeviceStateUpdate {
-                kind: "burning",
-                device_id: &plan.drive_id,
-                state: &state,
-            },
-            now,
-        )
-    }
-
-    fn append_enforcement_audit(
-        &self,
-        event_type: EventType,
-        action: &str,
-        result: &str,
-        resource_and_policy: Option<(&str, u64)>,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        self.store.append_audit(self.enforcement_audit_payload(
-            event_type,
-            action,
-            result,
-            resource_and_policy,
-            now,
-        ))
-    }
-
-    fn append_enforcement_audit_and_state(
-        &self,
-        event_type: EventType,
-        action: &str,
-        result: &str,
-        resource_and_policy: Option<(&str, u64)>,
-        update: DeviceStateUpdate<'_>,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        self.store.append_audit_and_upsert_device_state(
-            self.enforcement_audit_payload(event_type, action, result, resource_and_policy, now),
-            update.kind,
-            update.device_id,
-            update.state,
-            now,
-        )
-    }
-
-    fn enforcement_audit_payload(
+    fn audit_payload(
         &self,
         event_type: EventType,
         action: &str,
@@ -628,39 +606,29 @@ impl Service {
     }
 }
 
-fn remember_execution_failure(slot: &mut Option<ExecutionFailure>, failure: ExecutionFailure) {
-    if slot.is_none() {
-        *slot = Some(failure);
-    }
+/// USB 设备状态记录：最近一次观测到的启用状态与可用于归还审计的硬件摘要。
+fn usb_state(device: &UsbStorageDevice, enabled: bool) -> Value {
+    json!({
+        "enabled": enabled,
+        "vendor_id": device.vendor_id,
+        "product_id": device.product_id,
+        "serial": device.serial,
+    })
 }
 
-fn remember_persisted_execution_failure(
-    slot: &mut Option<ExecutionFailure>,
-    persistence: Result<(), StoreError>,
-    failure: ExecutionFailure,
-) {
-    remember_execution_failure(
-        slot,
-        persistence.map_or_else(ExecutionFailure::StatePersistence, |_| failure),
-    );
-}
-
-fn execution_failure_reason(failure: &ExecutionFailure) -> &'static str {
-    match failure {
-        ExecutionFailure::DeviceControl(_) => "device_control_failed",
-        ExecutionFailure::StatePersistence(_) => "state_persistence_failed",
+/// 只有读写都被明确允许时，允许清单才参与匹配。
+fn usb_allowlist(rules: &UsbRules) -> Vec<UsbAllowRule> {
+    if rules.read != ActionPolicy::Allow || rules.write != ActionPolicy::Allow {
+        return Vec::new();
     }
-}
-
-fn authorization_denial_reason(reason: AuthorizationDenial) -> &'static str {
-    match reason {
-        AuthorizationDenial::NoActivePolicy => "no_active_policy",
-        AuthorizationDenial::DeviceMismatch => "device_mismatch",
-        AuthorizationDenial::NotYetEffective => "not_yet_effective",
-        AuthorizationDenial::Expired => "expired",
-        AuthorizationDenial::TrustedTimeUnavailable => "trusted_time_unavailable",
-        AuthorizationDenial::ClockRollback => "clock_rollback",
-        AuthorizationDenial::AuditUnhealthy => "audit_unhealthy",
-        AuthorizationDenial::EnforcementUnhealthy => "enforcement_unhealthy",
-    }
+    rules
+        .allowed
+        .iter()
+        .map(|rule| UsbAllowRule {
+            instance_id: rule.instance_id.clone(),
+            vendor_id: rule.vendor_id.clone(),
+            product_id: rule.product_id.clone(),
+            serial: rule.serial.clone(),
+        })
+        .collect()
 }
