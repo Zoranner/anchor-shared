@@ -255,7 +255,9 @@ mod tests {
                 allowed: vec![],
             },
             scan: ScanRules {
-                controlled_dirs: vec!["D:\\data".into()],                file_types: vec![],                rules: vec![ScanRule {
+                controlled_dirs: vec!["D:\\data".into()],
+                file_types: vec![],
+                rules: vec![ScanRule {
                     rule_id: "r-1".into(),
                     kind: ScanRuleKind::Keyword,
                     pattern: "机密".into(),
