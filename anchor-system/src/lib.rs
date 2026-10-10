@@ -3,7 +3,6 @@
 pub mod burning;
 pub mod error;
 pub mod inventory;
-pub mod key_protect;
 pub mod nic;
 pub mod pipe;
 pub mod pnp;
