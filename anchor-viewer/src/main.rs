@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anchor_core::{verify_chain, AuditEvent};
-use anchor_store::Store;
+use anchor_core::{verify_chain, AuditEvent, EventType};
+use anchor_store::{EventFilter, Store};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -28,6 +28,30 @@ enum Command {
         db: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// 只导出该时间之后的事件（RFC 3339）。
+        #[arg(long)]
+        since: Option<String>,
+        /// 只导出该时间之前的事件（RFC 3339）。
+        #[arg(long)]
+        until: Option<String>,
+        /// 只导出指定事件类型。
+        #[arg(long)]
+        event_type: Option<String>,
+        /// 只导出指定操作者的事件。
+        #[arg(long)]
+        user: Option<String>,
+        /// 只导出指定设备标识的事件。
+        #[arg(long)]
+        device_id: Option<String>,
+        /// 只导出资源以该前缀开头的事件。
+        #[arg(long)]
+        resource_prefix: Option<String>,
+        /// 只导出指定策略版本的事件。
+        #[arg(long)]
+        policy_version: Option<u64>,
+        /// 最多导出的事件条数。
+        #[arg(long)]
+        limit: Option<u32>,
     },
 }
 
@@ -45,56 +69,46 @@ struct VerificationReport {
     event_count: usize,
 }
 
-struct Verification {
-    report: VerificationReport,
-    events: Vec<AuditEvent>,
-}
-
-fn verify_database(path: &Path) -> Verification {
+fn verify_database(path: &Path) -> VerificationReport {
     match Store::open_read_only(path).and_then(|store| store.read_audit_events()) {
-        Ok(events) if events.is_empty() => Verification {
-            report: VerificationReport {
-                status: VerificationStatus::Invalid,
-                event_count: 0,
-            },
-            events,
+        Ok(events) if events.is_empty() => VerificationReport {
+            status: VerificationStatus::Invalid,
+            event_count: 0,
         },
-        Ok(events) if verify_chain(&events).is_ok() => Verification {
-            report: VerificationReport {
-                status: VerificationStatus::Valid,
-                event_count: events.len(),
-            },
-            events,
+        Ok(events) if verify_chain(&events).is_ok() => VerificationReport {
+            status: VerificationStatus::Valid,
+            event_count: events.len(),
         },
-        Ok(events) => Verification {
-            report: VerificationReport {
-                status: VerificationStatus::Invalid,
-                event_count: events.len(),
-            },
-            events,
+        Ok(events) => VerificationReport {
+            status: VerificationStatus::Invalid,
+            event_count: events.len(),
         },
-        Err(_) => Verification {
-            report: VerificationReport {
-                status: VerificationStatus::Unavailable,
-                event_count: 0,
-            },
-            events: Vec::new(),
+        Err(_) => VerificationReport {
+            status: VerificationStatus::Unavailable,
+            event_count: 0,
         },
     }
 }
 
-fn write_export(out: &Path, verification: &Verification) -> anyhow::Result<()> {
+fn write_export(
+    out: &Path,
+    verification: &VerificationReport,
+    events: &[AuditEvent],
+) -> anyhow::Result<()> {
     fs::create_dir_all(out)?;
     let mut audit = File::create(out.join("audit.jsonl"))?;
-    for event in &verification.events {
+    for event in events {
         serde_json::to_writer(&mut audit, event)?;
         audit.write_all(b"\n")?;
     }
-    serde_json::to_writer_pretty(
-        File::create(out.join("verification.json"))?,
-        &verification.report,
-    )?;
+    serde_json::to_writer_pretty(File::create(out.join("verification.json"))?, verification)?;
     Ok(())
+}
+
+fn parse_time(value: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    Ok(chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|error| anyhow::anyhow!("{value} 不是 RFC 3339 时间: {error}"))?
+        .with_timezone(&chrono::Utc))
 }
 
 fn exit_code(status: VerificationStatus) -> ExitCode {
@@ -108,12 +122,41 @@ fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let verification = match cli.command {
         Command::Verify { db } => verify_database(&db),
-        Command::Export { db, out } => {
+        Command::Export {
+            db,
+            out,
+            since,
+            until,
+            event_type,
+            user,
+            device_id,
+            resource_prefix,
+            policy_version,
+            limit,
+        } => {
             let verification = verify_database(&db);
-            write_export(&out, &verification)?;
+            let filter = EventFilter {
+                since: since.as_deref().map(parse_time).transpose()?,
+                until: until.as_deref().map(parse_time).transpose()?,
+                event_type: event_type
+                    .as_deref()
+                    .map(|value| value.parse::<EventType>())
+                    .transpose()?,
+                user,
+                device_id,
+                resource_prefix,
+                policy_version,
+                limit,
+            };
+            let events = if verification.status == VerificationStatus::Unavailable {
+                Vec::new()
+            } else {
+                Store::open_read_only(&db)?.query_events(&filter)?
+            };
+            write_export(&out, &verification, &events)?;
             verification
         }
     };
-    println!("{}", serde_json::to_string(&verification.report)?);
-    Ok(exit_code(verification.report.status))
+    println!("{}", serde_json::to_string(&verification)?);
+    Ok(exit_code(verification.status))
 }

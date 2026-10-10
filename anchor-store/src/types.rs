@@ -102,8 +102,9 @@ pub struct EventFilter {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub event_type: Option<EventType>,
-    pub resource_prefix: Option<String>,
+    pub user: Option<String>,
     pub device_id: Option<String>,
+    pub resource_prefix: Option<String>,
     pub policy_version: Option<u64>,
     pub limit: Option<u32>,
 }

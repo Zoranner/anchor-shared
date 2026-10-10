@@ -619,67 +619,108 @@ impl Store {
         Ok(verify_chain(&self.read_audit_events()?).is_ok())
     }
 
+    /// 按条件查询审计事件；None 字段不参与过滤，结果按写入顺序返回。
+    pub fn query_events(&self, filter: &EventFilter) -> Result<Vec<AuditEvent>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let mut sql = String::from(
+            "SELECT event_id, device_id, user_name, timestamp, event_type, process, resource,
+                    policy_version, action, result, rule_id, prev_hash, event_hash
+             FROM audit_events WHERE 1 = 1",
+        );
+        let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = filter.since {
+            sql.push_str(" AND timestamp >= ?");
+            parameters.push(Box::new(since.to_rfc3339()));
+        }
+        if let Some(until) = filter.until {
+            sql.push_str(" AND timestamp <= ?");
+            parameters.push(Box::new(until.to_rfc3339()));
+        }
+        if let Some(event_type) = filter.event_type {
+            sql.push_str(" AND event_type = ?");
+            parameters.push(Box::new(event_type.as_str().to_string()));
+        }
+        if let Some(user) = &filter.user {
+            sql.push_str(" AND user_name = ?");
+            parameters.push(Box::new(user.clone()));
+        }
+        if let Some(device_id) = &filter.device_id {
+            sql.push_str(" AND device_id = ?");
+            parameters.push(Box::new(device_id.clone()));
+        }
+        if let Some(prefix) = &filter.resource_prefix {
+            sql.push_str(" AND resource LIKE ?");
+            parameters.push(Box::new(format!("{prefix}%")));
+        }
+        if let Some(version) = filter.policy_version {
+            sql.push_str(" AND policy_version = ?");
+            parameters.push(Box::new(version as i64));
+        }
+        sql.push_str(" ORDER BY sequence");
+        if let Some(limit) = filter.limit {
+            sql.push_str(" LIMIT ?");
+            parameters.push(Box::new(limit as i64));
+        }
+
+        let mut statement = connection.prepare(&sql)?;
+        let references: Vec<&dyn rusqlite::ToSql> =
+            parameters.iter().map(|value| value.as_ref()).collect();
+        let rows = statement.query_map(references.as_slice(), Self::audit_event_from_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     fn read_audit_events_in(connection: &Connection) -> Result<Vec<AuditEvent>, StoreError> {
         let mut statement = connection.prepare(
             "SELECT event_id, device_id, user_name, timestamp, event_type, process, resource,
                     policy_version, action, result, rule_id, prev_hash, event_hash
              FROM audit_events ORDER BY sequence",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
-            ))
-        })?;
+        let rows = statement.query_map([], Self::audit_event_from_row)?;
         let mut events = Vec::new();
         for row in rows {
-            let (
-                event_id,
-                device_id,
-                user,
-                timestamp,
-                event_type,
-                process,
-                resource,
-                policy_version,
-                action,
-                result,
-                rule_id,
-                prev_hash,
-                event_hash,
-            ) = row?;
-            events.push(AuditEvent {
-                payload: AuditPayload {
-                    event_id,
-                    device_id,
-                    user,
-                    timestamp: DateTime::parse_from_rfc3339(&timestamp)
-                        .map_err(|_| StoreError::TimeParse(timestamp))?
-                        .with_timezone(&Utc),
-                    event_type: event_type.parse()?,
-                    process,
-                    resource,
-                    policy_version: policy_version.map(|version| version as u64),
-                    action,
-                    result,
-                    rule_id,
-                    prev_hash,
-                },
-                event_hash,
-            });
+            events.push(row?);
         }
         Ok(events)
+    }
+
+    fn audit_event_from_row(row: &rusqlite::Row<'_>) -> Result<AuditEvent, rusqlite::Error> {
+        let timestamp = row.get::<_, String>(3)?;
+        let event_type = row.get::<_, String>(4)?;
+        let invalid = |index: usize, error: StoreError| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        };
+        Ok(AuditEvent {
+            payload: AuditPayload {
+                event_id: row.get(0)?,
+                device_id: row.get(1)?,
+                user: row.get(2)?,
+                timestamp: DateTime::parse_from_rfc3339(&timestamp)
+                    .map_err(|_| invalid(3, StoreError::TimeParse(timestamp.clone())))?
+                    .with_timezone(&Utc),
+                event_type: event_type
+                    .parse()
+                    .map_err(|error: anchor_core::CoreError| invalid(4, StoreError::Core(error)))?,
+                process: row.get(5)?,
+                resource: row.get(6)?,
+                policy_version: row.get::<_, Option<i64>>(7)?.map(|version| version as u64),
+                action: row.get(8)?,
+                result: row.get(9)?,
+                rule_id: row.get(10)?,
+                prev_hash: row.get(11)?,
+            },
+            event_hash: row.get(12)?,
+        })
     }
 
     fn append_audit_in(
@@ -768,6 +809,7 @@ mod tests {
                 },
                 scan: ScanRules {
                     controlled_dirs: vec![],
+                    file_types: vec![],
                     rules: vec![],
                 },
             },
@@ -1050,5 +1092,82 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.enforcement_failure().unwrap(), None);
+    }
+
+    #[test]
+    fn query_events_filters_by_type_user_resource_and_limit() {
+        let store = Store::in_memory().unwrap();
+        let append = |event_type: EventType, user: &str, resource: Option<&str>, result: &str| {
+            let mut payload = AuditPayload::new("laptop-1", user, event_type, "test", result);
+            payload.timestamp = now();
+            payload.resource = resource.map(str::to_string);
+            store.append_audit(payload).unwrap();
+        };
+        append(EventType::ServiceStart, "AnchorGuard", None, "running");
+        append(
+            EventType::ScanHit,
+            "alice",
+            Some("D:\\workspace\\report.txt"),
+            "hit",
+        );
+        append(
+            EventType::ScanCompleted,
+            "alice",
+            Some("D:\\workspace\\notes.txt"),
+            "clean",
+        );
+
+        let all = store.query_events(&EventFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            store
+                .query_events(&EventFilter {
+                    event_type: Some(EventType::ScanHit),
+                    ..EventFilter::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_events(&EventFilter {
+                    user: Some("alice".into()),
+                    ..EventFilter::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_events(&EventFilter {
+                    resource_prefix: Some("D:\\workspace\\report".into()),
+                    ..EventFilter::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_events(&EventFilter {
+                    limit: Some(2),
+                    ..EventFilter::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_events(&EventFilter {
+                    since: Some(now() + Duration::seconds(1)),
+                    ..EventFilter::default()
+                })
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }
