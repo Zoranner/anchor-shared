@@ -17,6 +17,7 @@ use std::{
 use anchor_core::{AuditPayload, EventType};
 use anchor_scan::scan_file;
 use anchor_store::{ScanRecord, ScanStatus, StoreError};
+use anchor_system::session::active_session_operator;
 use chrono::{DateTime, Utc};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
@@ -120,6 +121,9 @@ impl ScanRuntime {
         if !is_controlled(path, &policy.payload.scan.controlled_dirs) || !path.is_file() {
             return Ok(None);
         }
+        if !matches_file_type(path, &policy.payload.scan.file_types) {
+            return Ok(None);
+        }
         let before = match file_fingerprint(path) {
             Ok(fingerprint) => fingerprint,
             Err(_) => return Ok(None),
@@ -153,22 +157,33 @@ impl ScanRuntime {
             status,
         );
         record.matched_rules = matched_rules;
-        let audit = (status == ScanStatus::Hit).then(|| {
+        let operator = active_session_operator();
+        let (event_type, result) = match status {
+            ScanStatus::Hit => (EventType::ScanHit, "hit"),
+            ScanStatus::Clean => (EventType::ScanCompleted, "clean"),
+            ScanStatus::Error | ScanStatus::Pending => (EventType::ScanCompleted, "error"),
+        };
+        let audit = {
             let mut event = AuditPayload::new(
                 &service.device_id,
-                "AnchorGuard",
-                EventType::ScanHit,
+                operator
+                    .as_ref()
+                    .map_or("unknown", |operator| operator.user.as_str()),
+                event_type,
                 "scan_file",
-                "hit",
+                result,
             );
             event.timestamp = now;
             event.resource = Some(record.path.clone());
             event.policy_version = Some(policy.payload.version);
             event.rule_id = record.matched_rules.first().cloned();
+            event.process = operator.map(|operator| format!("session-{}", operator.session_id));
             record.last_event_id = Some(event.event_id.clone());
             event
-        });
-        service.store.upsert_scan_record(&record, audit, now)?;
+        };
+        service
+            .store
+            .upsert_scan_record(&record, Some(audit), now)?;
         Ok(Some(record))
     }
 }
@@ -231,6 +246,25 @@ fn is_controlled(path: &Path, controlled_dirs: &[String]) -> bool {
         .any(|directory| path.starts_with(Path::new(directory)))
 }
 
+/// 按策略声明的扩展名筛选；空列表表示扫描全部支持的类型。
+fn matches_file_type(path: &Path, file_types: &[String]) -> bool {
+    if file_types.is_empty() {
+        return true;
+    }
+    let Some(extension) = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    file_types.iter().any(|allowed| {
+        allowed
+            .trim_start_matches('.')
+            .eq_ignore_ascii_case(&extension)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -251,6 +285,10 @@ mod tests {
     }
 
     fn service(directory: &Path) -> Service {
+        service_with_file_types(directory, vec![])
+    }
+
+    fn service_with_file_types(directory: &Path, file_types: Vec<String>) -> Service {
         let policy = PolicyPackage::sign(
             PolicyPayload {
                 version: 1,
@@ -270,6 +308,7 @@ mod tests {
                 },
                 scan: ScanRules {
                     controlled_dirs: vec![directory.to_string_lossy().into_owned()],
+                    file_types,
                     rules: vec![ScanRule {
                         rule_id: "secret".into(),
                         kind: ScanRuleKind::Keyword,
@@ -330,5 +369,68 @@ mod tests {
             .scan_changed_path(&service(controlled.path()), &path, now())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn ignores_files_outside_the_declared_file_types() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("report.log");
+        fs::write(&path, "机密计划").unwrap();
+        let service = service_with_file_types(directory.path(), vec!["txt".into()]);
+
+        let record = ScanRuntime::new(std::time::Duration::ZERO)
+            .scan_changed_path(&service, &path, now())
+            .unwrap();
+
+        assert!(record.is_none());
+        assert!(!service
+            .store
+            .read_audit_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.payload.action == "scan_file"));
+    }
+
+    #[test]
+    fn clean_scan_is_indexed_and_audited_once() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("report.txt");
+        fs::write(&path, "普通内容").unwrap();
+        let service = service(directory.path());
+
+        let record = ScanRuntime::new(std::time::Duration::ZERO)
+            .scan_changed_path(&service, &path, now())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(record.status, ScanStatus::Clean);
+        let events = service.store.read_audit_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload.event_type == EventType::ScanCompleted
+                    && event.payload.result == "clean")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload.action == "scan_file")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_type_matching_accepts_declared_extensions_only() {
+        let txt = Path::new("D:\\work\\report.TXT");
+        let log = Path::new("D:\\work\\report.log");
+        let without_extension = Path::new("D:\\work\\report");
+
+        assert!(matches_file_type(txt, &[]));
+        assert!(matches_file_type(txt, &[".txt".into()]));
+        assert!(!matches_file_type(log, &["txt".into()]));
+        assert!(!matches_file_type(without_extension, &["txt".into()]));
     }
 }

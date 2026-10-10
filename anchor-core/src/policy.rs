@@ -86,6 +86,9 @@ pub struct ScanRule {
 pub struct ScanRules {
     #[serde(default)]
     pub controlled_dirs: Vec<String>,
+    /// 参与扫描的扩展名（小写、不带点）；为空表示扫描全部支持的类型。
+    #[serde(default)]
+    pub file_types: Vec<String>,
     #[serde(default)]
     pub rules: Vec<ScanRule>,
 }
@@ -252,8 +255,7 @@ mod tests {
                 allowed: vec![],
             },
             scan: ScanRules {
-                controlled_dirs: vec!["D:\\data".into()],
-                rules: vec![ScanRule {
+                controlled_dirs: vec!["D:\\data".into()],                file_types: vec![],                rules: vec![ScanRule {
                     rule_id: "r-1".into(),
                     kind: ScanRuleKind::Keyword,
                     pattern: "机密".into(),

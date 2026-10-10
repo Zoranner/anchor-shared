@@ -33,8 +33,7 @@ fn package(version: u64, key: &ed25519_dalek::SigningKey) -> PolicyPackage {
                 allowed: vec![],
             },
             scan: ScanRules {
-                controlled_dirs: vec!["D:\\workspace".into()],
-                rules: vec![],
+                controlled_dirs: vec!["D:\\workspace".into()],                file_types: vec![],                rules: vec![],
             },
         },
         key,

@@ -291,6 +291,60 @@ fn local_interactive_sessions() -> Result<Vec<InteractiveSession>, PlatformError
     ))
 }
 
+/// 当前活动会话的操作者：会话标识与登录用户名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOperator {
+    pub session_id: u32,
+    pub user: String,
+}
+
+/// 读取当前活动会话的登录用户名；没有活动会话或查询失败时返回 None。
+///
+/// 文件写入者无法在用户态可靠归属，因此调用方只应把该结果当作会话级近似。
+#[cfg(windows)]
+pub fn active_session_operator() -> Option<SessionOperator> {
+    let sessions = local_interactive_sessions().ok()?;
+    let session = sessions
+        .iter()
+        .find(|session| session.state == InteractiveSessionState::Active)?;
+    let user = session_user_name(session.id)?;
+    Some(SessionOperator {
+        session_id: session.id,
+        user,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn active_session_operator() -> Option<SessionOperator> {
+    None
+}
+
+/// 读取指定会话的登录用户名。
+#[cfg(windows)]
+fn session_user_name(session_id: u32) -> Option<String> {
+    let mut buffer: *mut u16 = std::ptr::null_mut();
+    let mut bytes = 0u32;
+    let queried = unsafe {
+        wts_query_session_information_w(
+            std::ptr::null_mut(),
+            session_id,
+            WTS_USER_NAME,
+            &mut buffer,
+            &mut bytes,
+        )
+    };
+    if queried == 0 || buffer.is_null() {
+        return None;
+    }
+    let units = unsafe { std::slice::from_raw_parts(buffer, (bytes / 2) as usize) };
+    let name = String::from_utf16_lossy(units)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    unsafe { wts_free_memory(buffer.cast()) };
+    (!name.is_empty()).then_some(name)
+}
+
 #[cfg(windows)]
 fn start_local_session_assistant(
     session_id: u32,
@@ -438,6 +492,8 @@ impl Drop for EnvironmentBlockGuard {
 
 #[cfg(windows)]
 const WTS_ACTIVE: i32 = 0;
+/// `WTSQuerySessionInformationW` 的用户名信息类别。
+const WTS_USER_NAME: u32 = 5;
 #[cfg(windows)]
 const WTS_CONNECTED: i32 = 1;
 #[cfg(windows)]
@@ -510,6 +566,14 @@ extern "system" {
     ) -> i32;
     #[link_name = "WTSQueryUserToken"]
     fn wts_query_user_token(session_id: u32, token: *mut isize) -> i32;
+    #[link_name = "WTSQuerySessionInformationW"]
+    fn wts_query_session_information_w(
+        server: *mut std::ffi::c_void,
+        session_id: u32,
+        info_class: u32,
+        buffer: *mut *mut u16,
+        bytes_returned: *mut u32,
+    ) -> i32;
     #[link_name = "WTSFreeMemory"]
     fn wts_free_memory(memory: *mut std::ffi::c_void);
 }

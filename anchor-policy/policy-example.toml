@@ -22,6 +22,8 @@ policy = "deny"
 # 不监视任何目录即不启用文件扫描；需要时再填写目录和规则。
 [scan]
 controlled_dirs = []
+# file_types 为空表示扫描全部支持的类型（txt、csv、docx、xlsx、pptx）。
+# file_types = ["txt", "docx"]
 
 # 需要放行个别设备时，把对应域的 deny 改成 allow 并列出例外，例如：
 #

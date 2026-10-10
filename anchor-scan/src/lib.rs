@@ -71,8 +71,7 @@ mod tests {
         let original = "公开\n机密计划\n";
         fs::write(&path, original).unwrap();
         let rules = ScanRules {
-            controlled_dirs: vec![],
-            rules: vec![ScanRule {
+            controlled_dirs: vec![],            file_types: vec![],            rules: vec![ScanRule {
                 rule_id: "secret".into(),
                 kind: ScanRuleKind::Keyword,
                 pattern: "机密".into(),
@@ -99,8 +98,7 @@ mod tests {
         fs::write(&text_path, "record-2026-001").unwrap();
         fs::write(&pdf_path, b"%PDF-not-read").unwrap();
         let rules = ScanRules {
-            controlled_dirs: vec![],
-            rules: vec![ScanRule {
+            controlled_dirs: vec![],            file_types: vec![],            rules: vec![ScanRule {
                 rule_id: "record".into(),
                 kind: ScanRuleKind::Regex,
                 pattern: r"record-\d{4}-\d+".into(),

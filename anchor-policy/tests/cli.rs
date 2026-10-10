@@ -105,6 +105,13 @@ fn sign_rejects_invalid_policy_configuration() {
             format!("unknown_key = 1\n{}", valid_config()),
         ),
         (
+            "blank-file-type",
+            valid_config().replace(
+                "controlled_dirs = [\"D:\\\\workspace\"]",
+                "controlled_dirs = [\"D:\\\\workspace\"]\nfile_types = [\".\"]",
+            ),
+        ),
+        (
             "invalid-expiry",
             valid_config().replace("2026-09-28T00:00:00Z", "not-a-timestamp"),
         ),

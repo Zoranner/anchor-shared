@@ -50,6 +50,7 @@ struct PolicyConfig {
 impl PolicyConfig {
     fn into_payload(self) -> Result<PolicyPayload> {
         validate_allowed_objects(&self.usb, &self.network, &self.burning)?;
+        validate_file_types(&self.scan)?;
 
         let expires_at = parse_time(&self.expires_at, "expires_at")?;
 
@@ -124,6 +125,16 @@ fn parse_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("{field} 不是 RFC 3339 时间"))?
         .with_timezone(&Utc))
+}
+
+/// 文件类型声明只要求非空；大小写与前导点由设备端归一化处理。
+fn validate_file_types(scan: &anchor_core::ScanRules) -> Result<()> {
+    for (index, file_type) in scan.file_types.iter().enumerate() {
+        if file_type.trim().trim_start_matches('.').is_empty() {
+            bail!("scan.file_types[{index}] 不能为空");
+        }
+    }
+    Ok(())
 }
 
 fn validate_allowed_objects(
