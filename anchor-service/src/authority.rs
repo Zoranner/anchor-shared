@@ -66,6 +66,25 @@ impl Service {
             .append_audit_and_set_enforcement_failure(event, "session_assistant_failed", now)
     }
 
+    /// 记录服务启动、审计校验与停止等生命周期事件。
+    pub fn record_lifecycle_event(
+        &self,
+        event_type: EventType,
+        action: &str,
+        result: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), anchor_store::StoreError> {
+        let mut event =
+            AuditPayload::new(&self.device_id, "AnchorGuard", event_type, action, result);
+        event.timestamp = now;
+        self.store.append_audit(event)
+    }
+
+    /// 返回本地审计链是否完整。
+    pub fn audit_chain_healthy(&self) -> Result<bool, anchor_store::StoreError> {
+        self.store.audit_chain_healthy()
+    }
+
     pub(crate) fn authorization_state_for_enforcement(
         &self,
         now: DateTime<Utc>,

@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use anchor_core::EventType;
 #[cfg(windows)]
 use anchor_service::scan_runtime::spawn_active_notify_scan_runtime;
 use anchor_service::{enforce::ObservedDevices, Service};
@@ -205,6 +206,19 @@ where
     F: Fn() -> bool,
 {
     let service = Arc::new(config.open_service()?);
+    service.record_lifecycle_event(
+        EventType::ServiceStart,
+        "service_start",
+        "running",
+        Utc::now(),
+    )?;
+    let audit_healthy = service.audit_chain_healthy().unwrap_or(false);
+    service.record_lifecycle_event(
+        EventType::AuditVerify,
+        "audit_chain",
+        if audit_healthy { "valid" } else { "invalid" },
+        Utc::now(),
+    )?;
     #[cfg(windows)]
     let _scan_runtime = spawn_active_notify_scan_runtime(Arc::clone(&service), SCAN_STABLE_DELAY)
         .context("启动文件扫描监听失败")?;
@@ -239,6 +253,12 @@ where
         }
     }
 
+    service.record_lifecycle_event(
+        EventType::ServiceStop,
+        "service_stop",
+        "stopped",
+        Utc::now(),
+    )?;
     listener_stop_requested.store(true, Ordering::SeqCst);
     control_listener
         .join()
@@ -435,6 +455,46 @@ device_id = "laptop-1"
 
         assert_eq!(config.device_id, "laptop-1");
         assert_eq!(config.verifying_key_hex.len(), 64);
+    }
+
+    #[test]
+    fn lifecycle_events_are_recorded_in_order() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let service = Service::new(
+            Store::open(database.path()).unwrap(),
+            crypto::generate_keypair().1,
+            "laptop-1",
+        );
+
+        service
+            .record_lifecycle_event(EventType::ServiceStart, "service_start", "running", now())
+            .unwrap();
+        service
+            .record_lifecycle_event(EventType::AuditVerify, "audit_chain", "valid", now())
+            .unwrap();
+        service
+            .record_lifecycle_event(EventType::ServiceStop, "service_stop", "stopped", now())
+            .unwrap();
+
+        let events = Store::open_read_only(database.path())
+            .unwrap()
+            .read_audit_events()
+            .unwrap();
+        let types: Vec<EventType> = events
+            .iter()
+            .map(|event| event.payload.event_type)
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                EventType::ServiceStart,
+                EventType::AuditVerify,
+                EventType::ServiceStop
+            ]
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.payload.user == "AnchorGuard"));
     }
 
     #[test]
