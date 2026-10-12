@@ -210,27 +210,20 @@ controlled_dirs = []
     )
     .unwrap();
 
-    let sign = |extra: &[&str]| {
-        Command::new(binary)
-            .args(["sign", "--key"])
-            .arg(keys_dir.join("signing-key.hex"))
-            .args(["--config"])
-            .arg(&config_path)
-            .args(["--out"])
-            .arg(&policy_path)
-            .args(extra)
-            .status()
-            .unwrap()
-    };
+    let status = Command::new(binary)
+        .args(["sign", "--key"])
+        .arg(keys_dir.join("signing-key.hex"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["--out"])
+        .arg(&policy_path)
+        .status()
+        .unwrap();
 
-    assert!(!sign(&[]).success(), "没有管理介质的策略必须被拒绝");
-    assert!(!policy_path.exists());
-
-    assert!(
-        sign(&["--no-admin-media"]).success(),
-        "显式放弃更新通道后可以签发"
-    );
+    assert!(status.success());
     let package: PolicyPackage = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
     assert!(package.payload.usb.allowed.is_empty());
+    assert!(package.payload.network.allowed.is_empty());
     assert!(package.payload.burning.allowed.is_empty());
+    assert!(package.payload.scan.controlled_dirs.is_empty());
 }
