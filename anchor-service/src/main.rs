@@ -32,9 +32,6 @@ use serde::Deserialize;
 use anyhow::bail;
 
 #[cfg(windows)]
-use clap::Parser;
-
-#[cfg(windows)]
 use anchor_system::{
     burning::WindowsBurningControlExecutor, inventory::observe_inventory,
     nic::WindowsNicControlExecutor, session::LocalSessionAssistantBackend,
@@ -122,13 +119,6 @@ struct ServiceConfig {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Parser)]
-struct ServiceArguments {
-    /// 安装程序写入的本地服务配置文件。
-    #[arg(long)]
-    config: PathBuf,
-}
-
 impl ServiceConfig {
     fn parse(content: &str) -> Result<Self> {
         Ok(toml::from_str(content)?)
@@ -318,6 +308,52 @@ fn record_startup_stage_at(path: &Path, stage: &str) -> std::io::Result<()> {
     }
 }
 
+/// 服务配置的默认位置，与安装程序写入的位置一致。
+#[cfg(windows)]
+fn default_config_path() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_DATA))
+        .join("Anchor Guard")
+        .join("service.toml")
+}
+
+/// 从服务参数里取配置路径，支持 `--config <路径>` 与 `--config=<路径>`。
+///
+/// 参数由服务控制管理器决定，内容不由本程序控制，因此其余参数一律忽略，缺省时使用
+/// 默认位置。安装程序不再传这个参数，它只保留给人工启动时覆盖用。
+#[cfg(windows)]
+fn config_path_from_arguments(arguments: &[OsString]) -> PathBuf {
+    for (index, argument) in arguments.iter().enumerate() {
+        let argument = argument.to_string_lossy();
+        if let Some(value) = argument.strip_prefix("--config=") {
+            if !value.is_empty() {
+                return PathBuf::from(value);
+            }
+        } else if argument == "--config" {
+            if let Some(value) = arguments.get(index + 1).filter(|value| !value.is_empty()) {
+                return PathBuf::from(value);
+            }
+        }
+    }
+    default_config_path()
+}
+
+/// 启动轨迹里记录服务参数；长度受限，避免异常参数把日志写爆。
+#[cfg(windows)]
+fn arguments_summary(arguments: &[OsString]) -> String {
+    let joined = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut summary: String = joined.chars().take(300).collect();
+    if summary.len() < joined.len() {
+        summary.push('…');
+    }
+    summary
+}
+
 #[cfg(windows)]
 fn main() -> Result<()> {
     record_startup_stage(STARTUP_FIRST_STAGE);
@@ -333,20 +369,19 @@ fn main() -> Result<()> {
 
 #[cfg(windows)]
 fn service_main(arguments: Vec<OsString>) {
-    record_startup_stage("service-main");
+    record_startup_stage(&format!(
+        "service-main args=[{}]",
+        arguments_summary(&arguments)
+    ));
     if let Err(error) = run_windows_service(arguments) {
-        eprintln!("Anchor Guard 服务启动失败: {error:#}");
+        record_startup_stage(&format!("service-main failed: {error:#}"));
     }
 }
 
 #[cfg(windows)]
 fn run_windows_service(arguments: Vec<OsString>) -> Result<()> {
-    let config_path = ServiceArguments::try_parse_from(
-        std::iter::once(OsString::from(SERVICE_NAME)).chain(arguments),
-    )
-    .context("解析 Windows Service 参数失败")?
-    .config;
-    record_startup_stage("arguments-parsed");
+    let config_path = config_path_from_arguments(&arguments);
+    record_startup_stage(&format!("config-path {}", config_path.display()));
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::clone(&stop_requested);
     let status_handle = service_control_handler::register(SERVICE_NAME, move |event| match event {
@@ -508,6 +543,28 @@ device_id = "laptop-1"
 
         assert_eq!(config.device_id, "laptop-1");
         assert_eq!(config.verifying_key_hex.len(), 64);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_config_path_prefers_an_explicit_argument() {
+        let default = super::default_config_path();
+        assert!(default.ends_with("Anchor Guard/service.toml"));
+
+        assert_eq!(super::config_path_from_arguments(&[]), default);
+        assert_eq!(
+            super::config_path_from_arguments(&[
+                std::ffi::OsString::from("--config"),
+                std::ffi::OsString::from(r"D:\cfg\service.toml"),
+            ]),
+            std::path::PathBuf::from(r"D:\cfg\service.toml")
+        );
+        assert_eq!(
+            super::config_path_from_arguments(&[std::ffi::OsString::from(
+                r"--config=D:\cfg\service.toml"
+            )]),
+            std::path::PathBuf::from(r"D:\cfg\service.toml")
+        );
     }
 
     #[cfg(windows)]
