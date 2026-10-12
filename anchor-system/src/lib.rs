@@ -6,6 +6,6 @@ pub mod inventory;
 pub mod nic;
 pub mod pipe;
 pub mod pnp;
-pub mod removable;
+pub mod policy_media;
 pub mod session;
 pub mod usb;

@@ -9,7 +9,7 @@ use anchor_store::Store;
 use anchor_system::{
     error::PlatformError,
     pipe::{serve_once, serve_session_status_once, PipeServeOutcome, DEFAULT_CONTROL_PIPE},
-    removable::removable_roots,
+    policy_media::policy_media_roots,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -139,8 +139,8 @@ impl Service {
             ServiceRequest::GetAuthorization => ServiceResponse::Authorization(
                 authorization_response(self.authorization_state(now)),
             ),
-            ServiceRequest::ImportFromRemovableRoots => {
-                let outcome = self.import_from_removable_roots(user, now);
+            ServiceRequest::ImportFromPolicyMedia => {
+                let outcome = self.import_from_policy_media(user, now);
                 ServiceResponse::Import(ImportResponse {
                     accepted: outcome.accepted,
                     reason: outcome.reason,
@@ -207,9 +207,9 @@ impl Service {
         serve_session_status_once(|request| self.handle_session_status_request(request, now))
     }
 
-    /// 枚举 Windows 已就绪可移动盘根目录后导入固定策略文件。
-    pub fn import_from_removable_roots(&self, user: &str, now: DateTime<Utc>) -> ImportOutcome {
-        let roots = removable_roots();
+    /// 枚举本地就绪卷根目录后导入固定策略文件。
+    pub fn import_from_policy_media(&self, user: &str, now: DateTime<Utc>) -> ImportOutcome {
+        let roots = policy_media_roots();
         let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
         self.import_from_roots(&roots, user, now)
     }

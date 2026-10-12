@@ -5,7 +5,7 @@
 - Provider `{7D56DFA0-7C16-4F0B-BB35-AD2E4A3B7021}`：仅显示状态和“导入策略”命令。
 - Filter `{B4D4951B-D540-4421-A90C-19E1BBABAFB8}`：只在登录和解锁时查询本地服务；服务超时、不可用或返回无效响应时拒绝系统登录项，只保留 Provider CLSID。
 
-Provider 不收集路径、密钥、PIN 或用户凭据。导入动作固定向本地服务发送 `ImportFromRemovableRoots`；服务接受导入后，Provider 调用 `CredentialsChanged` 让 LogonUI 重新枚举登录项。
+Provider 不收集路径、密钥、PIN 或用户凭据。导入动作固定向本地服务发送 `ImportFromPolicyMedia`；服务接受导入后，Provider 调用 `CredentialsChanged` 让 LogonUI 重新枚举登录项。
 
 ## Windows 注册和验证
 
@@ -38,7 +38,7 @@ New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\C
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Provider Filters\{B4D4951B-D540-4421-A90C-19E1BBABAFB8}' -Name '(Default)' -Value 'Anchor Guard 登录过滤'
 ```
 
-注册前必须确认 `AnchorGuard` 服务已运行，且其本地 Named Pipe 可用。随后锁定、解锁并重启虚拟机，分别验证有效策略、无策略、服务停止和可移动介质导入。任何无法恢复的登录状态都应立即还原 VM 快照。
+注册前必须确认 `AnchorGuard` 服务已运行，且其本地 Named Pipe 可用。随后锁定、解锁并重启虚拟机，分别验证有效策略、无策略、服务停止和策略介质导入。任何无法恢复的登录状态都应立即还原 VM 快照。
 
 ## 管理员卸载恢复
 

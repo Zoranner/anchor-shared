@@ -415,7 +415,7 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
             events: self.provider_events.as_ref(),
             advise_context: self.advise_context,
         };
-        *self.status.borrow_mut() = self.controller.import_from_removable_roots(&mut notifier);
+        *self.status.borrow_mut() = self.controller.import_from_policy_media(&mut notifier);
         Ok(())
     }
 

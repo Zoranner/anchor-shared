@@ -71,7 +71,7 @@ impl ImportTileStatus {
 
 /// 最小策略导入 tile 的显示状态与动作。
 ///
-/// 它不保存或收集路径、密钥、PIN 或用户凭据；动作固定委托给本地服务的可移动
+/// 它不保存或收集路径、密钥、PIN 或用户凭据；动作固定委托给本地服务的策略介质
 /// 根目录导入命令。
 pub struct ImportTile<T> {
     controller: CredentialProviderController<T>,
@@ -95,13 +95,10 @@ where
         &self.status
     }
 
-    pub fn import_from_removable_roots<C: CredentialsChanged>(
-        &mut self,
-        credentials_changed: &mut C,
-    ) {
+    pub fn import_from_policy_media<C: CredentialsChanged>(&mut self, credentials_changed: &mut C) {
         self.status = self
             .controller
-            .import_from_removable_roots(credentials_changed);
+            .import_from_policy_media(credentials_changed);
     }
 }
 
@@ -133,18 +130,18 @@ where
         self.authorization_state() == AuthorizationState::Allowed
     }
 
-    /// 请求服务扫描可移动介质根目录并导入策略。
+    /// 请求服务扫描本地卷根目录并导入策略。
     ///
     /// 此边界只发送固定命令，不接收或传递路径、密钥、PIN 或用户凭据。
     #[must_use]
-    pub fn import_from_removable_roots<C: CredentialsChanged>(
+    pub fn import_from_policy_media<C: CredentialsChanged>(
         &self,
         credentials_changed: &mut C,
     ) -> ImportTileStatus {
-        match self.transport.transact(
-            ServiceRequest::ImportFromRemovableRoots,
-            SERVICE_IPC_TIMEOUT,
-        ) {
+        match self
+            .transport
+            .transact(ServiceRequest::ImportFromPolicyMedia, SERVICE_IPC_TIMEOUT)
+        {
             Ok(ServiceResponse::Import(response)) if response.accepted => {
                 credentials_changed.credentials_changed();
                 ImportTileStatus::Imported(response.reason)

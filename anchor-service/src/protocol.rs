@@ -8,7 +8,7 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRequest {
     GetAuthorization,
-    ImportFromRemovableRoots,
+    ImportFromPolicyMedia,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,11 +76,11 @@ mod tests {
 
     #[test]
     fn length_prefixed_json_request_roundtrips() {
-        let frame = encode_frame(&ServiceRequest::ImportFromRemovableRoots).unwrap();
+        let frame = encode_frame(&ServiceRequest::ImportFromPolicyMedia).unwrap();
 
         assert_eq!(
             decode_frame::<ServiceRequest>(&frame).unwrap(),
-            ServiceRequest::ImportFromRemovableRoots
+            ServiceRequest::ImportFromPolicyMedia
         );
     }
 

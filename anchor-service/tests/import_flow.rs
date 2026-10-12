@@ -44,7 +44,7 @@ fn package(version: u64, key: &ed25519_dalek::SigningKey) -> PolicyPackage {
 }
 
 #[test]
-fn valid_package_in_a_removable_root_restores_authorization() {
+fn valid_package_in_a_policy_media_root_restores_authorization() {
     let root = tempdir().unwrap();
     let (signing_key, verifying_key) = crypto::generate_keypair();
     fs::write(
@@ -201,7 +201,7 @@ fn session_status_pipe_rejects_policy_import_requests() {
 
     let error = service
         .handle_session_status_request(
-            &serde_json::to_vec(&ServiceRequest::ImportFromRemovableRoots).unwrap(),
+            &serde_json::to_vec(&ServiceRequest::ImportFromPolicyMedia).unwrap(),
             now(),
         )
         .unwrap_err();

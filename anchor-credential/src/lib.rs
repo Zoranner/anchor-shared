@@ -80,7 +80,7 @@ mod controller_tests {
     }
 
     #[test]
-    fn import_action_sends_only_removable_roots_request_and_refreshes_on_success() {
+    fn import_action_sends_only_an_import_request_and_refreshes_on_success() {
         let transport =
             RecordingTransport::responding(Ok(ServiceResponse::Import(ImportResponse {
                 accepted: true,
@@ -89,13 +89,13 @@ mod controller_tests {
         let controller = CredentialProviderController::new(transport.clone());
         let mut credentials_changed = RecordingCredentialsChanged::default();
 
-        let status = controller.import_from_removable_roots(&mut credentials_changed);
+        let status = controller.import_from_policy_media(&mut credentials_changed);
 
         assert_eq!(status.message(), "imported");
         assert_eq!(credentials_changed.count, 1);
         assert_eq!(
             *transport.requests.lock().unwrap(),
-            vec![ServiceRequest::ImportFromRemovableRoots]
+            vec![ServiceRequest::ImportFromPolicyMedia]
         );
         assert_eq!(
             *transport.timeouts.lock().unwrap(),
@@ -113,7 +113,7 @@ mod controller_tests {
         let mut tile = ImportTile::new(CredentialProviderController::new(transport));
         let mut credentials_changed = RecordingCredentialsChanged::default();
 
-        tile.import_from_removable_roots(&mut credentials_changed);
+        tile.import_from_policy_media(&mut credentials_changed);
 
         assert_eq!(tile.status().message(), "invalid_signature");
         assert_eq!(credentials_changed.count, 0);

@@ -141,7 +141,7 @@ impl PolicyPackage {
     }
 }
 
-/// 从可移动介质导入策略的校验结论。
+/// 从策略介质导入策略的校验结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDecision {
     /// 签名、版本和到期时间均通过，可以替换本地策略。
