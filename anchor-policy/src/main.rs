@@ -33,6 +33,9 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// 确认这份策略不保留管理介质：设备此后只能离线改盘或重装才能更新。
+        #[arg(long)]
+        no_admin_media: bool,
     },
 }
 
@@ -48,9 +51,10 @@ struct PolicyConfig {
 }
 
 impl PolicyConfig {
-    fn into_payload(self) -> Result<PolicyPayload> {
+    fn into_payload(self, no_admin_media: bool) -> Result<PolicyPayload> {
         validate_allowed_objects(&self.usb, &self.network, &self.burning)?;
         validate_file_types(&self.scan)?;
+        validate_admin_media(&self.usb, &self.burning, no_admin_media)?;
 
         let expires_at = parse_time(&self.expires_at, "expires_at")?;
 
@@ -78,7 +82,12 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Keygen { out } => keygen(out),
-        Command::Sign { key, config, out } => sign(key, config, out),
+        Command::Sign {
+            key,
+            config,
+            out,
+            no_admin_media,
+        } => sign(key, config, out, no_admin_media),
     }
 }
 
@@ -104,7 +113,7 @@ fn keygen(out: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn sign(key_path: PathBuf, config_path: PathBuf, out: PathBuf) -> Result<()> {
+fn sign(key_path: PathBuf, config_path: PathBuf, out: PathBuf, no_admin_media: bool) -> Result<()> {
     let signing_key = crypto::signing_key_from_hex(
         fs::read_to_string(&key_path)
             .with_context(|| format!("无法读取私钥 {}", key_path.display()))?
@@ -115,7 +124,7 @@ fn sign(key_path: PathBuf, config_path: PathBuf, out: PathBuf) -> Result<()> {
             .with_context(|| format!("无法读取策略配置 {}", config_path.display()))?,
     )
     .with_context(|| format!("策略配置不是有效 TOML: {}", config_path.display()))?;
-    let package = PolicyPackage::sign(config.into_payload()?, &signing_key)?;
+    let package = PolicyPackage::sign(config.into_payload(no_admin_media)?, &signing_key)?;
     let content = serde_json::to_vec_pretty(&package)?;
     fs::write(&out, content).with_context(|| format!("无法写入策略包 {}", out.display()))?;
     Ok(())
@@ -133,6 +142,27 @@ fn validate_file_types(scan: &anchor_core::ScanRules) -> Result<()> {
         if file_type.trim().trim_start_matches('.').is_empty() {
             bail!("scan.file_types[{index}] 不能为空");
         }
+    }
+    Ok(())
+}
+
+/// 策略必须保留一条管理员更新通道：放行至少一支管理介质。
+///
+/// 物理机上没有可挂载的固定卷，内部盘又要进入系统才能写入；一旦把 USB 大容量存储和刻录
+/// 全部禁掉，设备就只能靠离线改盘或重装才能拿到新策略。因此签发时要求显式放行一支管理介质
+/// （`usb.allowed` 或 `burning.allowed` 非空），确需完全锁死时用 `--no-admin-media` 明确接受。
+fn validate_admin_media(
+    usb: &UsbRules,
+    burning: &BurningRules,
+    no_admin_media: bool,
+) -> Result<()> {
+    if no_admin_media {
+        return Ok(());
+    }
+    if usb.allowed.is_empty() && burning.allowed.is_empty() {
+        bail!(
+            "策略必须放行至少一支管理介质（usb.allowed 或 burning.allowed 非空），否则设备失去策略更新通道；确需完全锁死时加 --no-admin-media"
+        );
     }
     Ok(())
 }

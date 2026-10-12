@@ -6,10 +6,17 @@
 version = 1
 expires_at = "2026-12-31T15:59:59Z"
 
-# 禁用全部 USB 大容量存储；键盘、鼠标等非存储外设不受影响。
+# 禁用全部 USB 大容量存储，但保留下面这支管理 U 盘作为策略更新通道；
+# 键盘、鼠标等非存储外设不受任何 USB 规则影响。
 [usb]
 read = "deny"
 write = "deny"
+
+# 管理介质：策略必须放行至少一支用于后续导入策略的 U 盘（或用 burning.allowed 放行刻录光驱）。
+# 把下面的实例标识换成你自己的管理 U 盘；设备观测记录里能查到该标识。
+# 一旦策略生效，只有这里放行的介质还能被设备读取，所以别把这一项漏掉。
+[[usb.allowed]]
+instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\0019E06B"
 
 # 禁用全部网卡。
 [network]
@@ -18,6 +25,8 @@ policy = "deny"
 # 禁用全部刻录光驱。
 [burning]
 policy = "deny"
+
+# 确实要让设备彻底失去更新通道（此后只能离线改盘或重装）时，签发时加 --no-admin-media。
 
 # 不监视任何目录即不启用文件扫描；需要时再填写目录和规则。
 [scan]
