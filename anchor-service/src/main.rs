@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -272,8 +273,54 @@ where
 #[cfg(windows)]
 define_windows_service!(ffi_service_main, service_main);
 
+/// 服务启动轨迹文件名，与 `service.toml` 同目录。
+#[cfg(windows)]
+const STARTUP_LOG: &str = "service-startup.log";
+/// 首次记录使用的阶段名；它会重写文件，保证文件只保留最近一次启动的轨迹。
+#[cfg(windows)]
+const STARTUP_FIRST_STAGE: &str = "dispatch";
+/// 读不到 `ProgramData` 时的兜底根目录。
+#[cfg(windows)]
+const DEFAULT_PROGRAM_DATA: &str = r"C:\ProgramData";
+
+/// 记录服务启动阶段。
+///
+/// 服务启动失败在系统只留下“服务未能启动”一句，因此把启动阶段写进数据目录的
+/// `service-startup.log`：文件停在哪个阶段，卡点就在它之后。写入尽力而为，不影响服务本身。
+#[cfg(windows)]
+fn record_startup_stage(stage: &str) {
+    let _ = record_startup_stage_at(&startup_log_path(), stage);
+}
+
+#[cfg(windows)]
+fn startup_log_path() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_DATA))
+        .join("Anchor Guard")
+        .join(STARTUP_LOG)
+}
+
+#[cfg(windows)]
+fn record_startup_stage_at(path: &Path, stage: &str) -> std::io::Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    let line = format!("{} {stage}\r\n", Utc::now().to_rfc3339());
+    if stage == STARTUP_FIRST_STAGE {
+        fs::write(path, line)
+    } else {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(line.as_bytes())
+    }
+}
+
 #[cfg(windows)]
 fn main() -> Result<()> {
+    record_startup_stage(STARTUP_FIRST_STAGE);
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .context("启动 Windows Service 分发器失败")?;
     Ok(())
@@ -286,6 +333,7 @@ fn main() -> Result<()> {
 
 #[cfg(windows)]
 fn service_main(arguments: Vec<OsString>) {
+    record_startup_stage("service-main");
     if let Err(error) = run_windows_service(arguments) {
         eprintln!("Anchor Guard 服务启动失败: {error:#}");
     }
@@ -298,6 +346,7 @@ fn run_windows_service(arguments: Vec<OsString>) -> Result<()> {
     )
     .context("解析 Windows Service 参数失败")?
     .config;
+    record_startup_stage("arguments-parsed");
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::clone(&stop_requested);
     let status_handle = service_control_handler::register(SERVICE_NAME, move |event| match event {
@@ -308,6 +357,7 @@ fn run_windows_service(arguments: Vec<OsString>) -> Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     })
     .context("注册 Windows Service 控制器失败")?;
+    record_startup_stage("handler-registered");
 
     let result = (|| {
         status_handle
@@ -317,7 +367,9 @@ fn run_windows_service(arguments: Vec<OsString>) -> Result<()> {
                 0,
             ))
             .context("报告服务启动状态失败")?;
+        record_startup_stage("start-pending");
         let config = ServiceConfig::load(&config_path)?;
+        record_startup_stage("config-loaded");
         status_handle
             .set_service_status(service_status(
                 ServiceState::Running,
@@ -325,6 +377,7 @@ fn run_windows_service(arguments: Vec<OsString>) -> Result<()> {
                 0,
             ))
             .context("报告服务运行状态失败")?;
+        record_startup_stage("running");
         serve_until_stopped(config, || stop_requested.load(Ordering::SeqCst))
     })();
     status_handle
@@ -455,6 +508,24 @@ device_id = "laptop-1"
 
         assert_eq!(config.device_id, "laptop-1");
         assert_eq!(config.verifying_key_hex.len(), 64);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_log_keeps_only_the_latest_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service-startup.log");
+        let first_stage = super::STARTUP_FIRST_STAGE;
+
+        super::record_startup_stage_at(&path, first_stage).unwrap();
+        super::record_startup_stage_at(&path, "running").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(first_stage), "{content}");
+        assert!(content.contains("running"), "{content}");
+
+        super::record_startup_stage_at(&path, first_stage).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("running"), "{content}");
     }
 
     #[test]
