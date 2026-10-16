@@ -202,8 +202,9 @@ impl Service {
     /// Session 0，不调用锁屏 API。授权允许时，只对观测状态与策略期望不一致的设备下发
     /// 处置，并只为这些设备写入审计事件。
     ///
-    /// `logon_ui_active` 为真表示当前显示登录界面：可移动介质按只读通道放行，供登录界面读取
-    /// 介质上的策略文件，放行前必须先确认系统写保护生效。
+    /// `logon_ui_active` 为真表示当前显示登录界面：可移动介质与光驱按只读通道放行，供登录
+    /// 界面读取介质上的策略文件，放行前必须先确认系统级写入拒绝生效。只读通道不来自策略，
+    /// 因此授权拒绝时也维护它；授权拒绝时只跳过按策略下发的网卡处置。
     pub fn enforce_policy<U, N, B>(
         &self,
         usb_executor: &mut U,
@@ -218,25 +219,30 @@ impl Service {
         N: NicControlExecutor,
         B: BurningControlExecutor + WriteDenialSwitch,
     {
-        if let AuthorizationState::Denied(reason) = self.authorization_state_for_enforcement(now) {
-            self.record_denial_once(reason, now)?;
-            return Ok(EnforcementOutcome::Denied { reason });
-        }
-        self.clear_denial_once()?;
-
-        let active_policy = self
-            .store
-            .active_policy()?
-            .expect("allowed authorization requires an active policy");
-        let policy = &active_policy.payload;
-        let policy_version = policy.version;
+        let denial = match self.authorization_state_for_enforcement(now) {
+            AuthorizationState::Allowed => {
+                self.clear_denial_once()?;
+                None
+            }
+            AuthorizationState::Denied(reason) => {
+                self.record_denial_once(reason, now)?;
+                Some(reason)
+            }
+        };
+        let policy = self.store.active_policy()?;
+        let policy_version = policy.as_ref().map(|package| package.payload.version);
+        // 策略结论只在授权允许时下发；授权拒绝时设备处置无从依据，只保留登录界面的只读通道。
+        let policy_backed = denial.is_none();
 
         let mut applied = AppliedDispositions::default();
         let mut failure = None;
 
         let (usb, usb_failure) = self.reconcile_usb_storage(
             usb_executor,
-            &policy.usb,
+            policy
+                .as_ref()
+                .filter(|_| policy_backed)
+                .map(|package| &package.payload.usb),
             &observed.usb_storage,
             logon_ui_active,
             policy_version,
@@ -245,19 +251,24 @@ impl Service {
         applied.usb = usb;
         failure = failure.or(usb_failure);
 
-        let (adapters, nic_failure) = self.reconcile_network(
-            nic_executor,
-            &policy.network,
-            &observed.adapters,
-            policy_version,
-            now,
-        )?;
-        applied.adapters = adapters;
-        failure = failure.or(nic_failure);
+        if let Some(package) = policy.as_ref().filter(|_| policy_backed) {
+            let (adapters, nic_failure) = self.reconcile_network(
+                nic_executor,
+                &package.payload.network,
+                &observed.adapters,
+                policy_version.expect("策略存在时其版本可用"),
+                now,
+            )?;
+            applied.adapters = adapters;
+            failure = failure.or(nic_failure);
+        }
 
         let (burn_drives, burning_failure) = self.reconcile_burning(
             burning_executor,
-            &policy.burning,
+            policy
+                .as_ref()
+                .filter(|_| policy_backed)
+                .map(|package| &package.payload.burning),
             &observed.burn_drives,
             logon_ui_active,
             policy_version,
@@ -266,13 +277,16 @@ impl Service {
         applied.burn_drives = burn_drives;
         failure = failure.or(burning_failure);
 
-        match failure {
-            Some(failure) => Err(failure.into_error()),
-            None => {
-                self.store.clear_enforcement_failure()?;
-                Ok(EnforcementOutcome::Reconciled(applied))
-            }
+        if let Some(failure) = failure {
+            return Err(failure.into_error());
         }
+        if policy_backed {
+            self.store.clear_enforcement_failure()?;
+        }
+        Ok(match denial {
+            Some(reason) => EnforcementOutcome::Denied { reason },
+            None => EnforcementOutcome::Reconciled(applied),
+        })
     }
 
     /// 记录授权拒绝；相同原因连续出现时只保留一次审计。
@@ -307,16 +321,16 @@ impl Service {
     fn reconcile_usb_storage<U>(
         &self,
         executor: &mut U,
-        rules: &UsbRules,
+        rules: Option<&UsbRules>,
         observed: &[UsbStorageDevice],
         logon_ui_active: bool,
-        policy_version: u64,
+        policy_version: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<(Vec<UsbDisposition>, Option<ExecutionFailure>), StoreError>
     where
         U: UsbStorageExecutor + WriteDenialSwitch,
     {
-        let allowlist = usb_allowlist(rules);
+        let allowlist = rules.map(usb_allowlist);
         let recorded = self.store.device_states(USB_STATE_KIND)?;
         let mut applied = Vec::new();
         let mut present = Vec::new();
@@ -332,21 +346,26 @@ impl Service {
         let mut failure = denial.failure;
 
         for device in observed {
-            let plan = plan_usb_storage_control(device.clone(), &allowlist, logon_ui_active);
-            if plan.planned_action == UsbPlannedAction::RejectNonMassStorage {
+            let plan =
+                plan_usb_storage_control(device.clone(), allowlist.as_deref(), logon_ui_active);
+            let planned_action = plan.planned_action;
+            if planned_action == UsbPlannedAction::RejectNonMassStorage {
                 continue;
             }
             let instance_id = plan.device.instance_id.clone();
+            // 设备在场：保持现状的设备也要计入，避免被当成已移除。
             present.push(instance_id.clone());
-            let read_only = plan.planned_action == UsbPlannedAction::EnableMassStorageReadOnly;
             // 写保护没能落地时，只读通道保持禁用，不下发放行处置。
-            let desired_enabled = match plan.planned_action {
+            let desired_enabled = match planned_action {
                 UsbPlannedAction::EnableMassStorage => true,
                 UsbPlannedAction::EnableMassStorageReadOnly => denial.ready,
-                UsbPlannedAction::DisableMassStorage | UsbPlannedAction::RejectNonMassStorage => {
-                    false
+                UsbPlannedAction::DisableMassStorage => false,
+                // 保持现状：没有可依据的策略结论，设备留在 Windows 默认状态。
+                UsbPlannedAction::KeepCurrentState | UsbPlannedAction::RejectNonMassStorage => {
+                    continue;
                 }
             };
+            let read_only = planned_action == UsbPlannedAction::EnableMassStorageReadOnly;
 
             if !recorded
                 .iter()
@@ -417,7 +436,7 @@ impl Service {
                 EventType::UsbAttach,
                 "apply_usb_control",
                 result,
-                Some((&instance_id, policy_version)),
+                policy_version.map(|version| (instance_id.as_str(), version)),
                 now,
             );
             let state = usb_state(device, desired_enabled);
@@ -494,7 +513,7 @@ impl Service {
         executor: &mut D,
         audit: WriteDenialAudit,
         logon_ui_active: bool,
-        policy_version: u64,
+        policy_version: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<WriteDenialState, StoreError>
     where
@@ -536,7 +555,7 @@ impl Service {
             } else {
                 "disabled"
             },
-            Some((audit.resource, policy_version)),
+            policy_version.map(|version| (audit.resource, version)),
             now,
         );
         if let Err(error) = self.store.append_audit(event) {
@@ -590,7 +609,7 @@ impl Service {
                     EventType::NicChange,
                     "apply_nic_control",
                     &adapter.adapter_id,
-                    policy_version,
+                    Some(policy_version),
                     now,
                 );
                 remember_failure(&mut failure, recorded_failure);
@@ -625,7 +644,7 @@ impl Service {
                     EventType::NicChange,
                     "persist_nic_control",
                     &adapter.adapter_id,
-                    policy_version,
+                    Some(policy_version),
                     now,
                 );
                 remember_failure(&mut failure, recorded_failure);
@@ -638,10 +657,10 @@ impl Service {
     fn reconcile_burning<B>(
         &self,
         executor: &mut B,
-        rules: &BurningRules,
+        rules: Option<&BurningRules>,
         observed: &[BurnDriveInfo],
         logon_ui_active: bool,
-        policy_version: u64,
+        policy_version: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<(Vec<BurningDisposition>, Option<ExecutionFailure>), StoreError>
     where
@@ -663,11 +682,13 @@ impl Service {
             let desired_enabled = if logon_ui_active {
                 denial.ready
             } else {
-                rules.policy == ActionPolicy::Allow
-                    && rules
-                        .allowed
-                        .iter()
-                        .any(|rule| rule.drive_id == drive.drive_id)
+                rules.is_some_and(|rules| {
+                    rules.policy == ActionPolicy::Allow
+                        && rules
+                            .allowed
+                            .iter()
+                            .any(|rule| rule.drive_id == drive.drive_id)
+                })
             };
             if drive.enabled == desired_enabled {
                 continue;
@@ -697,7 +718,7 @@ impl Service {
                 EventType::BurnTask,
                 "apply_burning_control",
                 result,
-                Some((&drive.drive_id, policy_version)),
+                policy_version.map(|version| (drive.drive_id.as_str(), version)),
                 now,
             );
             applied.push(BurningDisposition {
@@ -733,7 +754,7 @@ impl Service {
         event_type: EventType,
         action: &str,
         resource: &str,
-        policy_version: u64,
+        policy_version: Option<u64>,
         now: DateTime<Utc>,
     ) -> ExecutionFailure {
         let reason = execution_failure_reason(&failure);
@@ -744,7 +765,7 @@ impl Service {
             event_type,
             action,
             "failed",
-            Some((resource, policy_version)),
+            policy_version.map(|version| (resource, version)),
             now,
         );
         match self

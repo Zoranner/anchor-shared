@@ -1299,3 +1299,145 @@ fn unlocked_sweep_clears_the_cd_write_denial_and_applies_the_policy() {
         1
     );
 }
+
+#[test]
+fn denied_authorization_still_opens_the_logon_read_only_channel() {
+    let test = TestService::without_policy();
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let drive_id = "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1";
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let outcome = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            ObservedDevices {
+                usb_storage: vec![usb_device(instance_id, false)],
+                burn_drives: vec![burn_drive(drive_id, false)],
+                ..ObservedDevices::default()
+            },
+            true,
+            now(),
+        )
+        .unwrap();
+
+    // 没有活动策略时登录界面仍要能读到介质上的策略文件。
+    assert_eq!(
+        outcome,
+        EnforcementOutcome::Denied {
+            reason: AuthorizationDenial::NoActivePolicy
+        }
+    );
+    assert_eq!(usb.calls, vec![(instance_id.to_string(), true)]);
+    assert_eq!(burning.calls, vec![(drive_id.to_string(), true)]);
+    assert_eq!(usb.denial.calls, vec![true]);
+    assert_eq!(burning.denial.calls, vec![true]);
+    assert_eq!(
+        audited_events(&test, "apply_usb_write_protection", "enabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_write_denial", "enabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_control", "enabled_read_only"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "authorization", "no_active_policy"),
+        1
+    );
+}
+
+#[test]
+fn denied_authorization_closes_the_logon_channel_when_unlocked() {
+    let test = TestService::without_policy();
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let mut usb = RecordingUsbExecutor {
+        denial: RecordingWriteDenial {
+            denied: true,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingUsbExecutor::default()
+    };
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor {
+        denial: RecordingWriteDenial {
+            denied: true,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingBurningExecutor::default()
+    };
+
+    let outcome = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, true)),
+            false,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        EnforcementOutcome::Denied {
+            reason: AuthorizationDenial::NoActivePolicy
+        }
+    );
+    // 解锁后写入拒绝关闭，且不处置设备。
+    assert_eq!(usb.denial.calls, vec![false]);
+    assert_eq!(burning.denial.calls, vec![false]);
+    assert!(usb.calls.is_empty());
+    assert!(burning.calls.is_empty());
+    assert_eq!(
+        audited_events(&test, "apply_usb_write_protection", "disabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_write_denial", "disabled"),
+        1
+    );
+}
+
+#[test]
+fn logon_channel_leaves_fixed_usb_storage_alone_without_a_policy() {
+    let test = TestService::without_policy();
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let outcome = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(fixed_usb_device(instance_id, true)),
+            true,
+            now(),
+        )
+        .unwrap();
+
+    // 固定类型卷无法变成只读，没有策略依据时也不据此禁用。
+    assert_eq!(
+        outcome,
+        EnforcementOutcome::Denied {
+            reason: AuthorizationDenial::NoActivePolicy
+        }
+    );
+    assert!(usb.calls.is_empty());
+    assert_eq!(audited_events(&test, "apply_usb_control", "disabled"), 0);
+}

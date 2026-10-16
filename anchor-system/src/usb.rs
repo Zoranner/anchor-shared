@@ -43,6 +43,8 @@ pub enum UsbPlannedAction {
     /// 登录界面下的可移动介质：启用为只读导入通道。
     EnableMassStorageReadOnly,
     DisableMassStorage,
+    /// 保持现状：没有可依据的策略结论，也不属于登录界面的只读通道。
+    KeepCurrentState,
     /// 不是 USB 大容量存储设备，拒绝执行设备状态变更。
     RejectNonMassStorage,
 }
@@ -57,12 +59,12 @@ pub struct UsbControlResult {
 
 /// 仅计算 USB 大容量存储设备的处置计划；未被允许的设备默认拒绝。
 ///
-/// `logon_ui_active` 为真表示当前显示登录界面：此时没有已解锁的交互会话，登录界面必须能读到
-/// 介质上的策略文件，因此可移动介质按只读通道放行。`matched_rule` 始终反映策略匹配结果，
-/// 登录界面的通道不改变它。
+/// `allowlist` 为 `None` 表示没有可依据的策略结论：解锁时不处置设备，登录界面下只放行可移动
+/// 介质的只读通道。`logon_ui_active` 为真表示当前显示登录界面，没有已解锁的交互会话，登录
+/// 界面必须能读到介质上的策略文件。`matched_rule` 始终反映策略匹配结果，登录界面的通道不改变它。
 pub fn plan_usb_storage_control(
     device: UsbStorageDevice,
-    allowed: &[UsbAllowRule],
+    allowlist: Option<&[UsbAllowRule]>,
     logon_ui_active: bool,
 ) -> UsbControlResult {
     if !is_usb_mass_storage_instance(&device.instance_id) {
@@ -73,13 +75,18 @@ pub fn plan_usb_storage_control(
         };
     }
 
-    let matched_rule = allowed.iter().position(|rule| rule_matches(rule, &device));
+    let matched_rule =
+        allowlist.and_then(|allowed| allowed.iter().position(|rule| rule_matches(rule, &device)));
     let planned_action = if logon_ui_active {
         if device.removable {
             UsbPlannedAction::EnableMassStorageReadOnly
-        } else {
+        } else if allowlist.is_some() {
             UsbPlannedAction::DisableMassStorage
+        } else {
+            UsbPlannedAction::KeepCurrentState
         }
+    } else if allowlist.is_none() {
+        UsbPlannedAction::KeepCurrentState
     } else if matched_rule.is_some() {
         UsbPlannedAction::EnableMassStorage
     } else {
@@ -259,7 +266,7 @@ mod tests {
             serial: Some("1".into()),
         };
 
-        let result = plan_usb_storage_control(device, &[], false);
+        let result = plan_usb_storage_control(device, Some(&[]), false);
 
         assert_eq!(result.matched_rule, None);
         assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
@@ -276,7 +283,7 @@ mod tests {
             serial: Some("1".into()),
         };
 
-        let result = plan_usb_storage_control(device, &[UsbAllowRule::default()], false);
+        let result = plan_usb_storage_control(device, Some(&[UsbAllowRule::default()]), false);
 
         assert_eq!(result.matched_rule, None);
         assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
@@ -298,7 +305,7 @@ mod tests {
             ..UsbAllowRule::default()
         }];
 
-        let result = plan_usb_storage_control(device, &allowed, false);
+        let result = plan_usb_storage_control(device, Some(&allowed), false);
 
         assert_eq!(result.matched_rule, Some(0));
         assert_eq!(result.planned_action, UsbPlannedAction::EnableMassStorage);
@@ -316,7 +323,7 @@ mod tests {
             serial: None,
         };
         assert_eq!(
-            plan_usb_storage_control(device, &[], false).planned_action,
+            plan_usb_storage_control(device, None, false).planned_action,
             UsbPlannedAction::RejectNonMassStorage
         );
         let mut executor = WindowsUsbStorageExecutor;
@@ -341,7 +348,7 @@ mod tests {
 
     #[test]
     fn logon_ui_opens_removable_mass_storage_as_a_read_only_channel() {
-        let result = plan_usb_storage_control(storage_device(true, false), &[], true);
+        let result = plan_usb_storage_control(storage_device(true, false), Some(&[]), true);
 
         assert_eq!(result.matched_rule, None);
         assert_eq!(
@@ -353,7 +360,7 @@ mod tests {
     #[test]
     fn logon_ui_keeps_fixed_usb_storage_disabled() {
         // 固定类型卷无法通过重新挂载变成只读，登录界面也不放行。
-        let result = plan_usb_storage_control(storage_device(false, true), &[], true);
+        let result = plan_usb_storage_control(storage_device(false, true), Some(&[]), true);
 
         assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
     }
@@ -366,12 +373,37 @@ mod tests {
             ..UsbAllowRule::default()
         }];
 
-        let result = plan_usb_storage_control(storage_device(true, true), &allowed, true);
+        let result = plan_usb_storage_control(storage_device(true, true), Some(&allowed), true);
 
         assert_eq!(result.matched_rule, Some(0));
         assert_eq!(
             result.planned_action,
             UsbPlannedAction::EnableMassStorageReadOnly
+        );
+    }
+
+    #[test]
+    fn logon_channel_without_a_policy_opens_removable_mass_storage() {
+        // 没有策略结论时，登录界面仍要能读到介质上的策略文件。
+        let result = plan_usb_storage_control(storage_device(true, false), None, true);
+
+        assert_eq!(result.matched_rule, None);
+        assert_eq!(
+            result.planned_action,
+            UsbPlannedAction::EnableMassStorageReadOnly
+        );
+    }
+
+    #[test]
+    fn storage_is_left_alone_when_there_is_no_policy() {
+        // 固定类型卷无法变成只读，也没有策略依据可以据此禁用；解锁后同样不处置设备。
+        assert_eq!(
+            plan_usb_storage_control(storage_device(false, true), None, true).planned_action,
+            UsbPlannedAction::KeepCurrentState
+        );
+        assert_eq!(
+            plan_usb_storage_control(storage_device(true, true), None, false).planned_action,
+            UsbPlannedAction::KeepCurrentState
         );
     }
 }
