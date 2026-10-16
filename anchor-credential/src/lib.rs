@@ -120,7 +120,7 @@ mod controller_tests {
     }
 
     #[test]
-    fn allowed_authorization_keeps_all_system_providers() {
+    fn allowed_authorization_keeps_system_providers_and_the_import_entry() {
         let transport = RecordingTransport::responding(Ok(ServiceResponse::Authorization(
             AuthorizationResponse::Allowed,
         )));
@@ -128,6 +128,9 @@ mod controller_tests {
 
         let visible = controller.filter_provider_ids(&["password".into(), "pin".into()]);
 
-        assert_eq!(visible, vec!["password", "pin"]);
+        assert_eq!(
+            visible,
+            vec!["password", "pin", super::filter::ANCHOR_PROVIDER_CLSID]
+        );
     }
 }
