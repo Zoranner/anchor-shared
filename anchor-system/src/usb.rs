@@ -8,6 +8,7 @@
 use crate::error::PlatformError;
 #[cfg(windows)]
 use crate::pnp;
+use crate::write_denial::WriteDenialSwitch;
 
 /// 大容量存储设备的稳定标识，用于按策略匹配。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +16,11 @@ pub struct UsbStorageDevice {
     pub instance_id: String,
     /// 观测到的启用状态；被禁用的大容量存储设备不会出现在磁盘枚举中。
     pub enabled: bool,
+    /// 介质是否可移动（`CM_DEVCAP_REMOVABLE`）。
+    ///
+    /// 登录界面只放行可移动介质：它们重新挂载时会读取系统写保护开关，因而能真正变成只读；
+    /// 固定类型卷做不到这一点，只能保持禁用。
+    pub removable: bool,
     pub vendor_id: Option<String>,
     pub product_id: Option<String>,
     pub serial: Option<String>,
@@ -34,6 +40,8 @@ pub struct UsbAllowRule {
 pub enum UsbPlannedAction {
     /// 仅允许的大容量存储设备恢复启用。
     EnableMassStorage,
+    /// 登录界面下的可移动介质：启用为只读导入通道。
+    EnableMassStorageReadOnly,
     DisableMassStorage,
     /// 不是 USB 大容量存储设备，拒绝执行设备状态变更。
     RejectNonMassStorage,
@@ -48,9 +56,14 @@ pub struct UsbControlResult {
 }
 
 /// 仅计算 USB 大容量存储设备的处置计划；未被允许的设备默认拒绝。
+///
+/// `logon_ui_active` 为真表示当前显示登录界面：此时没有已解锁的交互会话，登录界面必须能读到
+/// 介质上的策略文件，因此可移动介质按只读通道放行。`matched_rule` 始终反映策略匹配结果，
+/// 登录界面的通道不改变它。
 pub fn plan_usb_storage_control(
     device: UsbStorageDevice,
     allowed: &[UsbAllowRule],
+    logon_ui_active: bool,
 ) -> UsbControlResult {
     if !is_usb_mass_storage_instance(&device.instance_id) {
         return UsbControlResult {
@@ -61,7 +74,13 @@ pub fn plan_usb_storage_control(
     }
 
     let matched_rule = allowed.iter().position(|rule| rule_matches(rule, &device));
-    let planned_action = if matched_rule.is_some() {
+    let planned_action = if logon_ui_active {
+        if device.removable {
+            UsbPlannedAction::EnableMassStorageReadOnly
+        } else {
+            UsbPlannedAction::DisableMassStorage
+        }
+    } else if matched_rule.is_some() {
         UsbPlannedAction::EnableMassStorage
     } else {
         UsbPlannedAction::DisableMassStorage
@@ -86,6 +105,13 @@ pub trait UsbStorageExecutor {
     ) -> Result<(), PlatformError>;
 }
 
+/// 可移动介质写保护开关所在的注册表键。
+#[cfg(windows)]
+const WRITE_PROTECT_KEY: &str = r"SYSTEM\CurrentControlSet\Control\StorageDevicePolicies";
+/// 写保护开关的值名；非零表示可移动介质只读。
+#[cfg(windows)]
+const WRITE_PROTECT_VALUE: &str = "WriteProtect";
+
 /// Windows 10 USB 大容量存储设备执行器。
 #[derive(Debug, Default)]
 pub struct WindowsUsbStorageExecutor;
@@ -106,6 +132,24 @@ impl UsbStorageExecutor for WindowsUsbStorageExecutor {
     }
 }
 
+#[cfg(windows)]
+impl WriteDenialSwitch for WindowsUsbStorageExecutor {
+    fn write_denied(&mut self) -> Result<bool, PlatformError> {
+        Ok(
+            crate::registry::read_machine_dword(WRITE_PROTECT_KEY, WRITE_PROTECT_VALUE)?
+                .is_some_and(|value| value != 0),
+        )
+    }
+
+    fn set_write_denied(&mut self, denied: bool) -> Result<(), PlatformError> {
+        crate::registry::write_machine_dword(
+            WRITE_PROTECT_KEY,
+            WRITE_PROTECT_VALUE,
+            u32::from(denied),
+        )
+    }
+}
+
 #[cfg(not(windows))]
 impl UsbStorageExecutor for WindowsUsbStorageExecutor {
     fn set_mass_storage_enabled(
@@ -114,6 +158,17 @@ impl UsbStorageExecutor for WindowsUsbStorageExecutor {
         _enabled: bool,
     ) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported("Windows USB 大容量存储设备控制"))
+    }
+}
+
+#[cfg(not(windows))]
+impl WriteDenialSwitch for WindowsUsbStorageExecutor {
+    fn write_denied(&mut self) -> Result<bool, PlatformError> {
+        Err(PlatformError::Unsupported("Windows 可移动介质写保护"))
+    }
+
+    fn set_write_denied(&mut self, _denied: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Windows 可移动介质写保护"))
     }
 }
 
@@ -198,12 +253,13 @@ mod tests {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
             enabled: true,
+            removable: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
         };
 
-        let result = plan_usb_storage_control(device, &[]);
+        let result = plan_usb_storage_control(device, &[], false);
 
         assert_eq!(result.matched_rule, None);
         assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
@@ -214,12 +270,13 @@ mod tests {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
             enabled: true,
+            removable: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
         };
 
-        let result = plan_usb_storage_control(device, &[UsbAllowRule::default()]);
+        let result = plan_usb_storage_control(device, &[UsbAllowRule::default()], false);
 
         assert_eq!(result.matched_rule, None);
         assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
@@ -230,6 +287,7 @@ mod tests {
         let device = UsbStorageDevice {
             instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
             enabled: true,
+            removable: true,
             vendor_id: Some("1234".into()),
             product_id: Some("5678".into()),
             serial: Some("1".into()),
@@ -240,7 +298,7 @@ mod tests {
             ..UsbAllowRule::default()
         }];
 
-        let result = plan_usb_storage_control(device, &allowed);
+        let result = plan_usb_storage_control(device, &allowed, false);
 
         assert_eq!(result.matched_rule, Some(0));
         assert_eq!(result.planned_action, UsbPlannedAction::EnableMassStorage);
@@ -252,12 +310,13 @@ mod tests {
         let device = UsbStorageDevice {
             instance_id: "USB\\VID_1234&PID_5678\\1".into(),
             enabled: true,
+            removable: false,
             vendor_id: None,
             product_id: None,
             serial: None,
         };
         assert_eq!(
-            plan_usb_storage_control(device, &[]).planned_action,
+            plan_usb_storage_control(device, &[], false).planned_action,
             UsbPlannedAction::RejectNonMassStorage
         );
         let mut executor = WindowsUsbStorageExecutor;
@@ -267,5 +326,52 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, PlatformError::Failed(_)));
+    }
+
+    fn storage_device(removable: bool, enabled: bool) -> UsbStorageDevice {
+        UsbStorageDevice {
+            instance_id: "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1".into(),
+            enabled,
+            removable,
+            vendor_id: Some("1234".into()),
+            product_id: Some("5678".into()),
+            serial: Some("1".into()),
+        }
+    }
+
+    #[test]
+    fn logon_ui_opens_removable_mass_storage_as_a_read_only_channel() {
+        let result = plan_usb_storage_control(storage_device(true, false), &[], true);
+
+        assert_eq!(result.matched_rule, None);
+        assert_eq!(
+            result.planned_action,
+            UsbPlannedAction::EnableMassStorageReadOnly
+        );
+    }
+
+    #[test]
+    fn logon_ui_keeps_fixed_usb_storage_disabled() {
+        // 固定类型卷无法通过重新挂载变成只读，登录界面也不放行。
+        let result = plan_usb_storage_control(storage_device(false, true), &[], true);
+
+        assert_eq!(result.planned_action, UsbPlannedAction::DisableMassStorage);
+    }
+
+    #[test]
+    fn logon_ui_channel_ignores_the_allowlist() {
+        // 允许清单描述解锁后的读写结论；登录界面一律把可移动介质放行成只读。
+        let allowed = [UsbAllowRule {
+            serial: Some("1".into()),
+            ..UsbAllowRule::default()
+        }];
+
+        let result = plan_usb_storage_control(storage_device(true, true), &allowed, true);
+
+        assert_eq!(result.matched_rule, Some(0));
+        assert_eq!(
+            result.planned_action,
+            UsbPlannedAction::EnableMassStorageReadOnly
+        );
     }
 }

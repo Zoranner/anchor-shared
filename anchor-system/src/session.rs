@@ -1,7 +1,7 @@
 //! 当前交互会话锁定适配。
 //!
-//! Windows 实现仅调用 `LockWorkStation`。策略判断与会话协作程序的启动由服务层负责，
-//! 本模块只提供可替换的锁定动作。
+//! Windows 实现调用 `LockWorkStation` 锁定会话，并识别登录界面是否正在显示。策略判断与会话
+//! 协作程序的启动由服务层负责，本模块只提供可替换的锁定动作和只读的界面状态。
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,6 +9,63 @@ use std::{
 };
 
 use crate::error::PlatformError;
+
+/// 登录界面进程名；控制台登录页和锁屏页都由它承载。
+#[cfg(windows)]
+const LOGON_UI_PROCESS_NAME: &str = "LogonUI.exe";
+
+/// 判断登录界面是否正在显示。
+///
+/// 登录界面在开机未登录和交互会话锁定时都会出现，因此它为真表示当前没有已解锁的交互会话。
+/// 服务据此保留一条只读的本地策略导入通道：登录界面必须能读到介质上的策略文件。
+///
+/// 检测方式是枚举进程快照。它不依赖 IPC 和会话枚举结果，服务重启后立即可用；代价是远程桌面
+/// 会话也会让它为真，远程使用时不作为解锁依据。
+#[cfg(windows)]
+pub fn logon_ui_active() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return false,
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        let mut active = false;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if name.eq_ignore_ascii_case(LOGON_UI_PROCESS_NAME) {
+                    active = true;
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        active
+    }
+}
+
+/// 非 Windows 平台没有等价的登录界面概念，固定返回假。
+#[cfg(not(windows))]
+pub fn logon_ui_active() -> bool {
+    false
+}
 
 /// 可交互登录的 Windows 会话状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

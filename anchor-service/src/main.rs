@@ -22,6 +22,7 @@ use anchor_system::{
     nic::NicControlExecutor,
     session::{SessionAssistantLauncher, SessionAssistantLauncherBackend},
     usb::UsbStorageExecutor,
+    write_denial::WriteDenialSwitch,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -33,8 +34,10 @@ use anyhow::bail;
 
 #[cfg(windows)]
 use anchor_system::{
-    burning::WindowsBurningControlExecutor, inventory::observe_inventory,
-    nic::WindowsNicControlExecutor, session::LocalSessionAssistantBackend,
+    burning::WindowsBurningControlExecutor,
+    inventory::observe_inventory,
+    nic::WindowsNicControlExecutor,
+    session::{logon_ui_active, LocalSessionAssistantBackend},
     usb::WindowsUsbStorageExecutor,
 };
 
@@ -66,13 +69,14 @@ fn run_enforcement_once<O, U, N, B>(
     usb_executor: &mut U,
     nic_executor: &mut N,
     burning_executor: &mut B,
+    logon_ui_active: bool,
     now: chrono::DateTime<Utc>,
 ) -> Result<()>
 where
     O: FnOnce() -> Result<DeviceInventory, PlatformError>,
-    U: UsbStorageExecutor,
+    U: UsbStorageExecutor + WriteDenialSwitch,
     N: NicControlExecutor,
-    B: BurningControlExecutor,
+    B: BurningControlExecutor + WriteDenialSwitch,
 {
     let inventory = match observe() {
         Ok(inventory) => inventory,
@@ -89,6 +93,7 @@ where
             nic_executor,
             burning_executor,
             ObservedDevices::from(inventory),
+            logon_ui_active,
             now,
         )
         .map(|_| ())
@@ -106,6 +111,7 @@ fn run_windows_enforcement_once(service: &Service, now: chrono::DateTime<Utc>) -
         &mut usb,
         &mut nic,
         &mut burning,
+        logon_ui_active(),
         now,
     )
 }
@@ -640,6 +646,7 @@ device_id = "laptop-1"
             &mut usb,
             &mut nic,
             &mut burning,
+            false,
             now(),
         )
         .unwrap_err();
@@ -649,6 +656,7 @@ device_id = "laptop-1"
             &mut usb,
             &mut nic,
             &mut burning,
+            false,
             now(),
         )
         .unwrap_err();

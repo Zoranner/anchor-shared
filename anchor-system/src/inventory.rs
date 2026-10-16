@@ -34,6 +34,7 @@ pub fn observe_inventory() -> Result<DeviceInventory, PlatformError> {
                 UsbStorageDevice {
                     serial: usb_storage_serial(&device.instance_id),
                     enabled: !device.disabled,
+                    removable: device.removable,
                     instance_id: device.instance_id,
                     vendor_id,
                     product_id,

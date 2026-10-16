@@ -13,6 +13,7 @@ use anchor_system::{
     error::PlatformError,
     nic::{NicControlExecutor, NicInfo},
     usb::{UsbStorageDevice, UsbStorageExecutor},
+    write_denial::WriteDenialSwitch,
 };
 use chrono::{TimeZone, Utc};
 
@@ -103,17 +104,44 @@ fn burning_denied() -> BurningRules {
     }
 }
 
+/// 记录型系统级写入拒绝开关；USB 与刻录执行器各持有一个。
+#[derive(Default)]
+struct RecordingWriteDenial {
+    denied: bool,
+    calls: Vec<bool>,
+    failures: usize,
+}
+
+impl WriteDenialSwitch for RecordingWriteDenial {
+    fn write_denied(&mut self) -> Result<bool, PlatformError> {
+        Ok(self.denied)
+    }
+
+    fn set_write_denied(&mut self, denied: bool) -> Result<(), PlatformError> {
+        self.calls.push(denied);
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err(PlatformError::Failed(
+                "simulated write denial failure".into(),
+            ));
+        }
+        self.denied = denied;
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct RecordingUsbExecutor {
     calls: Vec<(String, bool)>,
     failures: Vec<String>,
+    denial: RecordingWriteDenial,
 }
 
 impl RecordingUsbExecutor {
     fn failing_for(instance_id: &str) -> Self {
         Self {
-            calls: Vec::new(),
             failures: vec![instance_id.into()],
+            ..Self::default()
         }
     }
 }
@@ -132,6 +160,16 @@ impl UsbStorageExecutor for RecordingUsbExecutor {
     }
 }
 
+impl WriteDenialSwitch for RecordingUsbExecutor {
+    fn write_denied(&mut self) -> Result<bool, PlatformError> {
+        self.denial.write_denied()
+    }
+
+    fn set_write_denied(&mut self, denied: bool) -> Result<(), PlatformError> {
+        self.denial.set_write_denied(denied)
+    }
+}
+
 #[derive(Default)]
 struct RecordingNicExecutor {
     calls: Vec<(String, bool)>,
@@ -147,6 +185,7 @@ impl NicControlExecutor for RecordingNicExecutor {
 #[derive(Default)]
 struct RecordingBurningExecutor {
     calls: Vec<(String, bool)>,
+    denial: RecordingWriteDenial,
 }
 
 impl BurningControlExecutor for RecordingBurningExecutor {
@@ -156,10 +195,21 @@ impl BurningControlExecutor for RecordingBurningExecutor {
     }
 }
 
+impl WriteDenialSwitch for RecordingBurningExecutor {
+    fn write_denied(&mut self) -> Result<bool, PlatformError> {
+        self.denial.write_denied()
+    }
+
+    fn set_write_denied(&mut self, denied: bool) -> Result<(), PlatformError> {
+        self.denial.set_write_denied(denied)
+    }
+}
+
 fn usb_device(instance_id: &str, enabled: bool) -> UsbStorageDevice {
     UsbStorageDevice {
         instance_id: instance_id.into(),
         enabled,
+        removable: true,
         vendor_id: None,
         product_id: None,
         serial: None,
@@ -196,7 +246,7 @@ fn enforce(
     let mut usb = RecordingUsbExecutor::default();
     let mut nic = RecordingNicExecutor::default();
     let mut burning = RecordingBurningExecutor::default();
-    service.enforce_policy(&mut usb, &mut nic, &mut burning, observed, now())
+    service.enforce_policy(&mut usb, &mut nic, &mut burning, observed, false, now())
 }
 
 #[test]
@@ -238,6 +288,7 @@ fn compliant_devices_are_not_touched_or_audited() {
                 &mut nic,
                 &mut burning,
                 observed_usb(usb_device(instance_id, false)),
+                false,
                 now(),
             )
             .unwrap();
@@ -272,6 +323,7 @@ fn unlisted_usb_storage_is_disabled_once_and_then_left_alone() {
             &mut nic,
             &mut burning,
             observed_usb(usb_device(instance_id, true)),
+            false,
             now(),
         )
         .unwrap();
@@ -282,6 +334,7 @@ fn unlisted_usb_storage_is_disabled_once_and_then_left_alone() {
             &mut nic,
             &mut burning,
             observed_usb(usb_device(instance_id, false)),
+            false,
             now(),
         )
         .unwrap();
@@ -354,6 +407,7 @@ fn allowlisted_usb_storage_is_enabled_when_observed_disabled() {
             &mut nic,
             &mut burning,
             observed_usb(usb_device(instance_id, false)),
+            false,
             now(),
         )
         .unwrap();
@@ -364,6 +418,7 @@ fn allowlisted_usb_storage_is_enabled_when_observed_disabled() {
             &mut nic,
             &mut burning,
             observed_usb(usb_device(instance_id, true)),
+            false,
             now(),
         )
         .unwrap();
@@ -462,6 +517,7 @@ fn deny_all_policy_disables_every_observed_controlled_device() {
                 adapters: vec![nic_adapter(wired, true), nic_adapter(wireless, true)],
                 burn_drives: vec![burn_drive(drive_id, true)],
             },
+            false,
             now(),
         )
         .unwrap();
@@ -578,6 +634,7 @@ fn network_state_drift_is_corrected_and_compliant_adapters_are_left_alone() {
                 ],
                 ..ObservedDevices::default()
             },
+            false,
             now(),
         )
         .unwrap();
@@ -594,6 +651,7 @@ fn network_state_drift_is_corrected_and_compliant_adapters_are_left_alone() {
                 ],
                 ..ObservedDevices::default()
             },
+            false,
             now(),
         )
         .unwrap();
@@ -657,6 +715,7 @@ fn device_control_failure_is_audited_once_and_keeps_the_service_denied() {
                 &mut nic,
                 &mut burning,
                 observed_usb(usb_device(instance_id, true)),
+                false,
                 now(),
             )
             .unwrap_err();
@@ -812,6 +871,7 @@ fn runtime_failure_state_write_failure_does_not_leave_service_authorized() {
             &mut nic,
             &mut burning,
             observed_usb(usb_device(instance_id, true)),
+            false,
             now(),
         )
         .unwrap_err();
@@ -831,4 +891,411 @@ fn runtime_failure_state_write_failure_does_not_leave_service_authorized() {
     assert!(!events
         .iter()
         .any(|event| { event.payload.event_type == EventType::AuthorizationDenied }));
+}
+
+/// 固定类型卷的 USB 存储：无法通过重新挂载变成只读。
+fn fixed_usb_device(instance_id: &str, enabled: bool) -> UsbStorageDevice {
+    UsbStorageDevice {
+        removable: false,
+        ..usb_device(instance_id, enabled)
+    }
+}
+
+/// 统计指定动作与结果的审计事件数。
+fn audited_events(test: &TestService, action: &str, result: &str) -> usize {
+    test.events()
+        .iter()
+        .filter(|event| event.payload.action == action && event.payload.result == result)
+        .count()
+}
+
+#[test]
+fn logon_ui_opens_a_read_only_channel_for_unlisted_removable_storage() {
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let first = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, false)),
+            true,
+            now(),
+        )
+        .unwrap();
+    let second = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, true)),
+            true,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first,
+        EnforcementOutcome::Reconciled(AppliedDispositions {
+            usb: vec![anchor_service::enforce::UsbDisposition {
+                instance_id: instance_id.into(),
+                enabled: true,
+            }],
+            ..AppliedDispositions::default()
+        })
+    );
+    assert_eq!(
+        second,
+        EnforcementOutcome::Reconciled(AppliedDispositions::default())
+    );
+    assert_eq!(usb.denial.calls, vec![true]);
+    assert_eq!(usb.calls, vec![(instance_id.to_string(), true)]);
+    assert_eq!(
+        audited_events(&test, "apply_usb_write_protection", "enabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        1
+    );
+}
+
+#[test]
+fn logon_ui_remounts_removable_storage_that_is_already_enabled() {
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let test = TestService::with_rules(
+        UsbRules {
+            read: ActionPolicy::Allow,
+            write: ActionPolicy::Allow,
+            allowed: vec![UsbAllowRule {
+                instance_id: Some(instance_id.into()),
+                vendor_id: None,
+                product_id: None,
+                serial: None,
+            }],
+        },
+        network_denied(),
+        burning_denied(),
+    );
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let outcome = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, true)),
+            true,
+            now(),
+        )
+        .unwrap();
+
+    // 写保护只对开启之后挂载的介质生效，因此已启用的设备要先卸载再挂载一次。
+    assert_eq!(
+        usb.calls,
+        vec![
+            (instance_id.to_string(), false),
+            (instance_id.to_string(), true)
+        ]
+    );
+    assert_eq!(usb.denial.calls, vec![true]);
+    assert_eq!(
+        outcome,
+        EnforcementOutcome::Reconciled(AppliedDispositions {
+            usb: vec![anchor_service::enforce::UsbDisposition {
+                instance_id: instance_id.into(),
+                enabled: true,
+            }],
+            ..AppliedDispositions::default()
+        })
+    );
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        1
+    );
+}
+
+#[test]
+fn logon_ui_keeps_fixed_usb_storage_disabled() {
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let test = TestService::with_rules(usb_allow_everything(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let outcome = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(fixed_usb_device(instance_id, true)),
+            true,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        EnforcementOutcome::Reconciled(AppliedDispositions {
+            usb: vec![anchor_service::enforce::UsbDisposition {
+                instance_id: instance_id.into(),
+                enabled: false,
+            }],
+            ..AppliedDispositions::default()
+        })
+    );
+    assert_eq!(usb.calls, vec![(instance_id.to_string(), false)]);
+    assert_eq!(audited_events(&test, "apply_usb_control", "disabled"), 1);
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        0
+    );
+}
+
+#[test]
+fn missing_write_protection_keeps_the_logon_channel_closed() {
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor {
+        denial: RecordingWriteDenial {
+            failures: 1,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingUsbExecutor::default()
+    };
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let error = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, false)),
+            true,
+            now(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, EnforcementError::DeviceControl(_)));
+    // 写保护没落地时设备保持禁用，登录界面拿不到写通道。
+    assert!(usb.calls.is_empty());
+    assert_eq!(
+        audited_events(&test, "apply_usb_write_protection", "failed"),
+        1
+    );
+    assert_eq!(
+        test.service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+
+    // 下一轮写保护落地成功后，只读通道重新放行。
+    test.service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, false)),
+            true,
+            now(),
+        )
+        .unwrap();
+    assert_eq!(usb.calls, vec![(instance_id.to_string(), true)]);
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        1
+    );
+}
+
+#[test]
+fn unlocked_sweep_turns_removable_write_protection_off() {
+    let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor {
+        denial: RecordingWriteDenial {
+            denied: true,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingUsbExecutor::default()
+    };
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    test.service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_usb(usb_device(instance_id, false)),
+            false,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(usb.denial.calls, vec![false]);
+    assert!(!usb.denial.denied);
+    assert_eq!(
+        audited_events(&test, "apply_usb_write_protection", "disabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_usb_control", "enabled_read_only"),
+        0
+    );
+}
+
+fn observed_burn_drive(drive_id: &str, enabled: bool) -> ObservedDevices {
+    ObservedDevices {
+        burn_drives: vec![burn_drive(drive_id, enabled)],
+        ..ObservedDevices::default()
+    }
+}
+
+#[test]
+fn logon_ui_opens_optical_drives_as_a_read_only_channel() {
+    let drive_id = "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor::default();
+
+    let first = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_burn_drive(drive_id, false),
+            true,
+            now(),
+        )
+        .unwrap();
+    let second = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_burn_drive(drive_id, true),
+            true,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first,
+        EnforcementOutcome::Reconciled(AppliedDispositions {
+            burn_drives: vec![anchor_service::enforce::BurningDisposition {
+                drive_id: drive_id.into(),
+                enabled: true,
+            }],
+            ..AppliedDispositions::default()
+        })
+    );
+    assert_eq!(
+        second,
+        EnforcementOutcome::Reconciled(AppliedDispositions::default())
+    );
+    assert_eq!(burning.denial.calls, vec![true]);
+    assert_eq!(burning.calls, vec![(drive_id.to_string(), true)]);
+    assert_eq!(
+        audited_events(&test, "apply_burning_write_denial", "enabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_control", "enabled_read_only"),
+        1
+    );
+}
+
+#[test]
+fn missing_cd_write_denial_keeps_optical_drives_disabled() {
+    let drive_id = "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor {
+        denial: RecordingWriteDenial {
+            failures: 1,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingBurningExecutor::default()
+    };
+
+    let error = test
+        .service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_burn_drive(drive_id, true),
+            true,
+            now(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, EnforcementError::DeviceControl(_)));
+    // 写入拒绝没落地时光驱不被放行，已是启用状态的要收回到禁用。
+    assert_eq!(burning.calls, vec![(drive_id.to_string(), false)]);
+    assert_eq!(
+        audited_events(&test, "apply_burning_write_denial", "failed"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_control", "enabled_read_only"),
+        0
+    );
+    assert_eq!(
+        test.service.authorization_state(now()),
+        AuthorizationState::Denied(AuthorizationDenial::EnforcementUnhealthy)
+    );
+}
+
+#[test]
+fn unlocked_sweep_clears_the_cd_write_denial_and_applies_the_policy() {
+    let drive_id = "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1";
+    let test = TestService::with_rules(usb_denied(), network_denied(), burning_denied());
+    let mut usb = RecordingUsbExecutor::default();
+    let mut nic = RecordingNicExecutor::default();
+    let mut burning = RecordingBurningExecutor {
+        denial: RecordingWriteDenial {
+            denied: true,
+            ..RecordingWriteDenial::default()
+        },
+        ..RecordingBurningExecutor::default()
+    };
+
+    test.service
+        .enforce_policy(
+            &mut usb,
+            &mut nic,
+            &mut burning,
+            observed_burn_drive(drive_id, true),
+            false,
+            now(),
+        )
+        .unwrap();
+
+    assert_eq!(burning.denial.calls, vec![false]);
+    assert!(!burning.denial.denied);
+    assert_eq!(burning.calls, vec![(drive_id.to_string(), false)]);
+    assert_eq!(
+        audited_events(&test, "apply_burning_write_denial", "disabled"),
+        1
+    );
+    assert_eq!(
+        audited_events(&test, "apply_burning_control", "disabled"),
+        1
+    );
 }

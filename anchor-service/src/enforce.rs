@@ -17,6 +17,7 @@ use anchor_system::{
         plan_usb_storage_control, UsbAllowRule, UsbPlannedAction, UsbStorageDevice,
         UsbStorageExecutor,
     },
+    write_denial::WriteDenialSwitch,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -32,6 +33,32 @@ const NIC_STATE_KIND: &str = "nic";
 const BURNING_STATE_KIND: &str = "burning";
 /// 设备库存观测失败的运行期原因。
 const INVENTORY_FAILURE_REASON: &str = "inventory_observation_failed";
+/// 审计资源：系统级可移动介质写保护开关。
+const REMOVABLE_MEDIA_RESOURCE: &str = "removable-media";
+/// 审计资源：系统级 CD/DVD 写入拒绝开关。
+const OPTICAL_MEDIA_RESOURCE: &str = "optical-media";
+
+/// 一次写入拒绝开关落地对应的审计标识。
+#[derive(Debug, Clone, Copy)]
+struct WriteDenialAudit {
+    event_type: EventType,
+    action: &'static str,
+    resource: &'static str,
+}
+
+/// 可移动介质写保护开关的审计标识。
+const REMOVABLE_WRITE_DENIAL: WriteDenialAudit = WriteDenialAudit {
+    event_type: EventType::UsbAttach,
+    action: "apply_usb_write_protection",
+    resource: REMOVABLE_MEDIA_RESOURCE,
+};
+
+/// CD/DVD 写入拒绝开关的审计标识。
+const OPTICAL_WRITE_DENIAL: WriteDenialAudit = WriteDenialAudit {
+    event_type: EventType::BurnTask,
+    action: "apply_burning_write_denial",
+    resource: OPTICAL_MEDIA_RESOURCE,
+};
 
 /// 服务本轮已观测到的受控设备。调用方负责观测，本模块不枚举设备。
 #[derive(Debug, Default)]
@@ -119,6 +146,16 @@ fn remember_failure(slot: &mut Option<ExecutionFailure>, failure: ExecutionFailu
     }
 }
 
+/// 本轮系统级写入拒绝开关的落地结论。
+struct WriteDenialState {
+    /// 开关已与登录界面状态一致；假表示开关没能落地，只读通道不得放行设备。
+    ready: bool,
+    /// 本轮刚开启写入拒绝：靠挂载时读取该开关才生效的介质要重新挂载一次。
+    just_enabled: bool,
+    /// 开关落地失败时的执行失败，由调用方与其他设备失败一起上报。
+    failure: Option<ExecutionFailure>,
+}
+
 fn authorization_denial_reason(reason: AuthorizationDenial) -> &'static str {
     match reason {
         AuthorizationDenial::NoActivePolicy => "no_active_policy",
@@ -164,18 +201,22 @@ impl Service {
     /// 授权拒绝时只记录一次拒绝结论；锁定交互会话由该会话内的协作程序负责，服务运行在
     /// Session 0，不调用锁屏 API。授权允许时，只对观测状态与策略期望不一致的设备下发
     /// 处置，并只为这些设备写入审计事件。
+    ///
+    /// `logon_ui_active` 为真表示当前显示登录界面：可移动介质按只读通道放行，供登录界面读取
+    /// 介质上的策略文件，放行前必须先确认系统写保护生效。
     pub fn enforce_policy<U, N, B>(
         &self,
         usb_executor: &mut U,
         nic_executor: &mut N,
         burning_executor: &mut B,
         observed: ObservedDevices,
+        logon_ui_active: bool,
         now: DateTime<Utc>,
     ) -> Result<EnforcementOutcome, EnforcementError>
     where
-        U: UsbStorageExecutor,
+        U: UsbStorageExecutor + WriteDenialSwitch,
         N: NicControlExecutor,
-        B: BurningControlExecutor,
+        B: BurningControlExecutor + WriteDenialSwitch,
     {
         if let AuthorizationState::Denied(reason) = self.authorization_state_for_enforcement(now) {
             self.record_denial_once(reason, now)?;
@@ -197,6 +238,7 @@ impl Service {
             usb_executor,
             &policy.usb,
             &observed.usb_storage,
+            logon_ui_active,
             policy_version,
             now,
         )?;
@@ -217,6 +259,7 @@ impl Service {
             burning_executor,
             &policy.burning,
             &observed.burn_drives,
+            logon_ui_active,
             policy_version,
             now,
         )?;
@@ -266,26 +309,44 @@ impl Service {
         executor: &mut U,
         rules: &UsbRules,
         observed: &[UsbStorageDevice],
+        logon_ui_active: bool,
         policy_version: u64,
         now: DateTime<Utc>,
     ) -> Result<(Vec<UsbDisposition>, Option<ExecutionFailure>), StoreError>
     where
-        U: UsbStorageExecutor,
+        U: UsbStorageExecutor + WriteDenialSwitch,
     {
         let allowlist = usb_allowlist(rules);
         let recorded = self.store.device_states(USB_STATE_KIND)?;
         let mut applied = Vec::new();
-        let mut failure = None;
         let mut present = Vec::new();
 
+        // 只读通道先落地写保护再放行设备：写保护只对该开关开启之后挂载的介质生效。
+        let denial = self.reconcile_write_denial(
+            executor,
+            REMOVABLE_WRITE_DENIAL,
+            logon_ui_active,
+            policy_version,
+            now,
+        )?;
+        let mut failure = denial.failure;
+
         for device in observed {
-            let plan = plan_usb_storage_control(device.clone(), &allowlist);
+            let plan = plan_usb_storage_control(device.clone(), &allowlist, logon_ui_active);
             if plan.planned_action == UsbPlannedAction::RejectNonMassStorage {
                 continue;
             }
             let instance_id = plan.device.instance_id.clone();
             present.push(instance_id.clone());
-            let desired_enabled = plan.planned_action == UsbPlannedAction::EnableMassStorage;
+            let read_only = plan.planned_action == UsbPlannedAction::EnableMassStorageReadOnly;
+            // 写保护没能落地时，只读通道保持禁用，不下发放行处置。
+            let desired_enabled = match plan.planned_action {
+                UsbPlannedAction::EnableMassStorage => true,
+                UsbPlannedAction::EnableMassStorageReadOnly => denial.ready,
+                UsbPlannedAction::DisableMassStorage | UsbPlannedAction::RejectNonMassStorage => {
+                    false
+                }
+            };
 
             if !recorded
                 .iter()
@@ -314,7 +375,22 @@ impl Service {
             }
 
             if device.enabled == desired_enabled {
-                continue;
+                // 写保护刚开启时，已经挂载的可移动介质要重新挂载一次才是只读。
+                if !(read_only && denial.just_enabled && device.enabled) {
+                    continue;
+                }
+                if let Err(error) = executor.set_mass_storage_enabled(&instance_id, false) {
+                    let recorded_failure = self.note_execution_failure(
+                        ExecutionFailure::DeviceControl(error),
+                        EventType::UsbAttach,
+                        "remount_usb_read_only",
+                        &instance_id,
+                        policy_version,
+                        now,
+                    );
+                    remember_failure(&mut failure, recorded_failure);
+                    continue;
+                }
             }
 
             if let Err(error) = executor.set_mass_storage_enabled(&instance_id, desired_enabled) {
@@ -330,10 +406,12 @@ impl Service {
                 continue;
             }
 
-            let result = if desired_enabled {
-                "enabled"
-            } else {
+            let result = if !desired_enabled {
                 "disabled"
+            } else if read_only {
+                "enabled_read_only"
+            } else {
+                "enabled"
             };
             let event = self.audit_payload(
                 EventType::UsbAttach,
@@ -405,6 +483,81 @@ impl Service {
         }
 
         Ok((applied, failure))
+    }
+
+    /// 让指定的系统级写入拒绝开关与登录界面状态一致。
+    ///
+    /// 开关已经符合期望时不做任何写入；不一致时下发并把结果写进审计。失败时记录运行期失败
+    /// 并返回未就绪，调用方据此不放行对应的只读通道。
+    fn reconcile_write_denial<D>(
+        &self,
+        executor: &mut D,
+        audit: WriteDenialAudit,
+        logon_ui_active: bool,
+        policy_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<WriteDenialState, StoreError>
+    where
+        D: WriteDenialSwitch,
+    {
+        let settled = WriteDenialState {
+            ready: true,
+            just_enabled: false,
+            failure: None,
+        };
+        if executor
+            .write_denied()
+            .is_ok_and(|denied| denied == logon_ui_active)
+        {
+            return Ok(settled);
+        }
+
+        if let Err(error) = executor.set_write_denied(logon_ui_active) {
+            let failure = self.note_execution_failure(
+                ExecutionFailure::DeviceControl(error),
+                audit.event_type,
+                audit.action,
+                audit.resource,
+                policy_version,
+                now,
+            );
+            return Ok(WriteDenialState {
+                ready: false,
+                just_enabled: false,
+                failure: Some(failure),
+            });
+        }
+
+        let event = self.audit_payload(
+            audit.event_type,
+            audit.action,
+            if logon_ui_active {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            Some((audit.resource, policy_version)),
+            now,
+        );
+        if let Err(error) = self.store.append_audit(event) {
+            let failure = self.note_execution_failure(
+                ExecutionFailure::StatePersistence(error),
+                audit.event_type,
+                audit.action,
+                audit.resource,
+                policy_version,
+                now,
+            );
+            return Ok(WriteDenialState {
+                ready: false,
+                just_enabled: false,
+                failure: Some(failure),
+            });
+        }
+        Ok(WriteDenialState {
+            just_enabled: logon_ui_active,
+            ..settled
+        })
     }
 
     fn reconcile_network<N>(
@@ -487,21 +640,35 @@ impl Service {
         executor: &mut B,
         rules: &BurningRules,
         observed: &[BurnDriveInfo],
+        logon_ui_active: bool,
         policy_version: u64,
         now: DateTime<Utc>,
     ) -> Result<(Vec<BurningDisposition>, Option<ExecutionFailure>), StoreError>
     where
-        B: BurningControlExecutor,
+        B: BurningControlExecutor + WriteDenialSwitch,
     {
+        // 登录界面的只读通道先落地 CD/DVD 写入拒绝，再放行光驱读取。
+        let denial = self.reconcile_write_denial(
+            executor,
+            OPTICAL_WRITE_DENIAL,
+            logon_ui_active,
+            policy_version,
+            now,
+        )?;
         let mut applied = Vec::new();
-        let mut failure = None;
+        let mut failure = denial.failure;
 
         for drive in observed {
-            let desired_enabled = rules.policy == ActionPolicy::Allow
-                && rules
-                    .allowed
-                    .iter()
-                    .any(|rule| rule.drive_id == drive.drive_id);
+            // 登录界面下光驱一律只读可用：写入拒绝没落地时保持禁用。
+            let desired_enabled = if logon_ui_active {
+                denial.ready
+            } else {
+                rules.policy == ActionPolicy::Allow
+                    && rules
+                        .allowed
+                        .iter()
+                        .any(|rule| rule.drive_id == drive.drive_id)
+            };
             if drive.enabled == desired_enabled {
                 continue;
             }
@@ -519,10 +686,12 @@ impl Service {
                 continue;
             }
 
-            let result = if desired_enabled {
-                "enabled"
-            } else {
+            let result = if !desired_enabled {
                 "disabled"
+            } else if logon_ui_active {
+                "enabled_read_only"
+            } else {
+                "enabled"
             };
             let event = self.audit_payload(
                 EventType::BurnTask,

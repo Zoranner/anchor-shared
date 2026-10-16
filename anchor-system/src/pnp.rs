@@ -8,9 +8,10 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_IDW, CM_Get_Device_ID_Size, CM_Get_Parent, SetupDiCallClassInstaller,
     SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, CONFIGFLAG_DISABLED, DICS_DISABLE,
-    DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIGCF_PRESENT, HDEVINFO, SPDRP_CONFIGFLAGS,
-    SPDRP_FRIENDLYNAME, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
+    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, CM_DEVCAP_REMOVABLE,
+    CONFIGFLAG_DISABLED, DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE,
+    DIGCF_PRESENT, HDEVINFO, SPDRP_CAPABILITIES, SPDRP_CONFIGFLAGS, SPDRP_FRIENDLYNAME,
+    SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
 };
 
 use crate::error::PlatformError;
@@ -37,6 +38,11 @@ pub struct PnpDevice {
     pub friendly_name: Option<String>,
     /// 设备是否被系统禁用（`CONFIGFLAG_DISABLED`）。
     pub disabled: bool,
+    /// 设备是否带可移动介质（`CM_DEVCAP_REMOVABLE`）。
+    ///
+    /// 锁定期间只有可移动介质参与只读导入通道；固定类型卷的 USB 存储保持禁用，
+    /// 因为它们无法可靠地写保护。
+    pub removable: bool,
 }
 
 impl PnpDevice {
@@ -90,6 +96,8 @@ pub fn enumerate(class: &GUID) -> Result<Vec<PnpDevice>, PlatformError> {
             friendly_name: registry_property_string(device_info_set, &info, SPDRP_FRIENDLYNAME),
             disabled: registry_property_u32(device_info_set, &info, SPDRP_CONFIGFLAGS)
                 .is_some_and(|flags| flags & CONFIGFLAG_DISABLED.0 != 0),
+            removable: registry_property_u32(device_info_set, &info, SPDRP_CAPABILITIES)
+                .is_some_and(|capabilities| capabilities & CM_DEVCAP_REMOVABLE.0 != 0),
         });
     }
     Ok(devices)

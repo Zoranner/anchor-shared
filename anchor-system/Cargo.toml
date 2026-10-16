@@ -13,6 +13,9 @@ thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
 ] }
 
 [dev-dependencies]
