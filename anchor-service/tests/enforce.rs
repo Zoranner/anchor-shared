@@ -1362,6 +1362,7 @@ fn denied_authorization_still_opens_the_logon_read_only_channel() {
 fn denied_authorization_closes_the_logon_channel_when_unlocked() {
     let test = TestService::without_policy();
     let instance_id = "USBSTOR\\Disk&Ven_Example&Prod_Storage\\1";
+    let drive_id = "SCSI\\CDROM&VEN_VENDOR&PROD_WRITER\\1";
     let mut usb = RecordingUsbExecutor {
         denial: RecordingWriteDenial {
             denied: true,
@@ -1384,7 +1385,11 @@ fn denied_authorization_closes_the_logon_channel_when_unlocked() {
             &mut usb,
             &mut nic,
             &mut burning,
-            observed_usb(usb_device(instance_id, true)),
+            ObservedDevices {
+                usb_storage: vec![usb_device(instance_id, true)],
+                burn_drives: vec![burn_drive(drive_id, true)],
+                ..ObservedDevices::default()
+            },
             false,
             now(),
         )

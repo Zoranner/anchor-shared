@@ -679,16 +679,17 @@ impl Service {
 
         for drive in observed {
             // 登录界面下光驱一律只读可用：写入拒绝没落地时保持禁用。
-            let desired_enabled = if logon_ui_active {
-                denial.ready
-            } else {
-                rules.is_some_and(|rules| {
+            let desired_enabled = match (rules, logon_ui_active) {
+                (_, true) => denial.ready,
+                (Some(rules), false) => {
                     rules.policy == ActionPolicy::Allow
                         && rules
                             .allowed
                             .iter()
                             .any(|rule| rule.drive_id == drive.drive_id)
-                })
+                }
+                // 没有策略依据时不下发处置，光驱留在原状。
+                (None, false) => continue,
             };
             if drive.enabled == desired_enabled {
                 continue;
