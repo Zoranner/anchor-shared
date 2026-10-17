@@ -105,6 +105,8 @@ pub fn enumerate(class: &GUID) -> Result<Vec<PnpDevice>, PlatformError> {
 
 /// 启用或停用一台设备；调用需要管理员权限。
 pub fn set_enabled(class: &GUID, instance_id: &str, enabled: bool) -> Result<(), PlatformError> {
+    let change = if enabled { "enable" } else { "disable" };
+    trace(&format!("{change} {instance_id} start"));
     let device_info_set = unsafe { SetupDiCreateDeviceInfoList(Some(class), None) }
         .map_err(|error| PlatformError::Failed(format!("创建设备信息列表失败: {error}")))?;
     let _guard = DeviceInfoSetGuard(device_info_set);
@@ -120,11 +122,15 @@ pub fn set_enabled(class: &GUID, instance_id: &str, enabled: bool) -> Result<(),
             Some(&mut info),
         )
     }
-    .map_err(|error| PlatformError::Failed(format!("打开设备 {instance_id} 失败: {error}")))?;
+    .map_err(|error| {
+        trace(&format!("{change} {instance_id} open failed: {error}"));
+        PlatformError::Failed(format!("打开设备 {instance_id} 失败: {error}"))
+    })?;
+    trace(&format!("{change} {instance_id} opened"));
 
     let params = SP_PROPCHANGE_PARAMS {
         ClassInstallHeader: SP_CLASSINSTALL_HEADER {
-            cbSize: size_of::<SP_PROPCHANGE_PARAMS>() as u32,
+            cbSize: size_of::<SP_CLASSINSTALL_HEADER>() as u32,
             InstallFunction: DIF_PROPERTYCHANGE,
         },
         StateChange: if enabled { DICS_ENABLE } else { DICS_DISABLE },
@@ -140,14 +146,23 @@ pub fn set_enabled(class: &GUID, instance_id: &str, enabled: bool) -> Result<(),
         )
     }
     .map_err(|error| {
+        trace(&format!("{change} {instance_id} params failed: {error}"));
         PlatformError::Failed(format!("设置设备 {instance_id} 状态参数失败: {error}"))
     })?;
-    unsafe { SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, Some(&info)) }.map_err(
-        |error| {
-            let change = if enabled { "启用" } else { "停用" };
-            PlatformError::Failed(format!("{change}设备 {instance_id} 失败: {error}"))
-        },
-    )
+    trace(&format!("{change} {instance_id} apply"));
+    match unsafe { SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, Some(&info)) } {
+        Ok(()) => {
+            trace(&format!("{change} {instance_id} ok"));
+            Ok(())
+        }
+        Err(error) => {
+            trace(&format!("{change} {instance_id} failed: {error}"));
+            let action = if enabled { "启用" } else { "停用" };
+            Err(PlatformError::Failed(format!(
+                "{action}设备 {instance_id} 失败: {error}"
+            )))
+        }
+    }
 }
 
 fn device_info(_set: HDEVINFO) -> Result<SP_DEVINFO_DATA, PlatformError> {
@@ -210,6 +225,32 @@ fn wide_to_string(buffer: &[u16]) -> String {
         .position(|unit| *unit == 0)
         .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..end])
+}
+
+/// 追加设备控制轨迹到数据目录；写失败不影响处置本身。
+///
+/// 设备状态变更失败会让服务整体进入不可用状态，出问题时需要知道卡在哪一步，因此单独留一份
+/// 可读轨迹，而不只依赖审计事件。
+#[cfg(windows)]
+fn trace(message: &str) {
+    use std::io::Write;
+
+    let Some(root) = std::env::var_os("ProgramData") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(root)
+        .join("Anchor Guard")
+        .join("device-control.log");
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{} {message}", chrono::Utc::now().to_rfc3339());
+    }
 }
 
 struct DeviceInfoSetGuard(HDEVINFO);
