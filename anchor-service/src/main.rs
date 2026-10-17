@@ -375,6 +375,10 @@ fn main() -> Result<()> {
 
 #[cfg(windows)]
 fn service_main(arguments: Vec<OsString>) {
+    // 服务没有控制台：panic 默认只写 stderr，进程消失后无从定位，因此写进启动日志。
+    std::panic::set_hook(Box::new(|info| {
+        record_startup_stage(&format!("panic: {info}"));
+    }));
     record_startup_stage(&format!(
         "service-main args=[{}]",
         arguments_summary(&arguments)
