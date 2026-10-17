@@ -91,7 +91,7 @@ mod controller_tests {
 
         let status = controller.import_from_policy_media(&mut credentials_changed);
 
-        assert_eq!(status.message(), "imported");
+        assert_eq!(status.message(), "导入成功（imported）");
         assert_eq!(credentials_changed.count, 1);
         assert_eq!(
             *transport.requests.lock().unwrap(),
@@ -115,7 +115,7 @@ mod controller_tests {
 
         tile.import_from_policy_media(&mut credentials_changed);
 
-        assert_eq!(tile.status().message(), "invalid_signature");
+        assert_eq!(tile.status().message(), "导入失败（策略签名无效）");
         assert_eq!(credentials_changed.count, 0);
     }
 

@@ -7,6 +7,7 @@ use std::{
     ffi::c_void,
     mem::{size_of, zeroed},
     ptr::null_mut,
+    rc::Rc,
 };
 
 use windows::{
@@ -201,15 +202,17 @@ pub extern "system" fn DllCanUnloadNow() -> windows::core::HRESULT {
 /// 只含状态和导入命令的最小 Credential Provider。
 #[implement(ICredentialProvider)]
 struct AnchorImportProvider {
-    events: RefCell<Option<ICredentialProviderEvents>>,
-    advise_context: Cell<usize>,
+    events: Rc<RefCell<Option<ICredentialProviderEvents>>>,
+    advise_context: Rc<Cell<usize>>,
+    status: Rc<RefCell<ImportTileStatus>>,
 }
 
 impl AnchorImportProvider {
     fn new() -> Self {
         Self {
-            events: RefCell::new(None),
-            advise_context: Cell::new(0),
+            events: Rc::new(RefCell::new(None)),
+            advise_context: Rc::new(Cell::new(0)),
+            status: Rc::new(RefCell::new(ImportTileStatus::Ready)),
         }
     }
 }
@@ -288,26 +291,33 @@ impl ICredentialProvider_Impl for AnchorImportProvider_Impl {
         if dwindex != 0 {
             return Err(Error::from(E_INVALIDARG));
         }
-        Ok(
-            AnchorImportCredential::new(self.events.borrow().clone(), self.advise_context.get())
-                .into(),
+        Ok(AnchorImportCredential::new(
+            Rc::clone(&self.events),
+            Rc::clone(&self.advise_context),
+            Rc::clone(&self.status),
         )
+        .into())
     }
 }
 
 #[implement(ICredentialProviderCredential)]
 struct AnchorImportCredential {
     controller: CredentialProviderController<AnchorPipeTransport>,
-    status: RefCell<ImportTileStatus>,
-    provider_events: Option<ICredentialProviderEvents>,
-    advise_context: usize,
+    /// 与 Provider 共享的导入状态：登录页重新枚举后仍能显示上一次的导入结果。
+    status: Rc<RefCell<ImportTileStatus>>,
+    provider_events: Rc<RefCell<Option<ICredentialProviderEvents>>>,
+    advise_context: Rc<Cell<usize>>,
 }
 
 impl AnchorImportCredential {
-    fn new(provider_events: Option<ICredentialProviderEvents>, advise_context: usize) -> Self {
+    fn new(
+        provider_events: Rc<RefCell<Option<ICredentialProviderEvents>>>,
+        advise_context: Rc<Cell<usize>>,
+        status: Rc<RefCell<ImportTileStatus>>,
+    ) -> Self {
         Self {
             controller: CredentialProviderController::new(AnchorPipeTransport),
-            status: RefCell::new(ImportTileStatus::Ready),
+            status,
             provider_events,
             advise_context,
         }
@@ -355,14 +365,13 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
     }
 
     fn GetStringValue(&self, dwfieldid: u32) -> Result<PWSTR> {
-        let status = self.status.borrow();
         let value = match dwfieldid {
-            0 => "Anchor Guard",
-            1 => status.message(),
-            2 => "导入策略",
+            0 => "Anchor Guard".to_string(),
+            1 => self.status.borrow().message(),
+            2 => "导入策略".to_string(),
             _ => return Err(Error::from(E_INVALIDARG)),
         };
-        allocate_wide_string(value)
+        allocate_wide_string(&value)
     }
 
     fn GetBitmapValue(&self, _dwfieldid: u32) -> Result<HBITMAP> {
@@ -412,10 +421,12 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
             return Err(Error::from(E_INVALIDARG));
         }
         let mut notifier = ProviderEventsChanged {
-            events: self.provider_events.as_ref(),
-            advise_context: self.advise_context,
+            events: self.provider_events.borrow().clone(),
+            advise_context: self.advise_context.get(),
         };
         *self.status.borrow_mut() = self.controller.import_from_policy_media(&mut notifier);
+        // 成功和失败都要让登录页重新枚举：成功时系统登录项回来，失败时显示原因。
+        notifier.credentials_changed();
         Ok(())
     }
 
@@ -453,14 +464,14 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
     }
 }
 
-struct ProviderEventsChanged<'a> {
-    events: Option<&'a ICredentialProviderEvents>,
+struct ProviderEventsChanged {
+    events: Option<ICredentialProviderEvents>,
     advise_context: usize,
 }
 
-impl CredentialsChanged for ProviderEventsChanged<'_> {
+impl CredentialsChanged for ProviderEventsChanged {
     fn credentials_changed(&mut self) {
-        if let Some(events) = self.events {
+        if let Some(events) = &self.events {
             let _ = unsafe { events.CredentialsChanged(self.advise_context) };
         }
     }

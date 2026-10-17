@@ -59,14 +59,32 @@ pub enum ImportTileStatus {
 }
 
 impl ImportTileStatus {
+    /// 登录页展示的状态文字。服务返回的原因码在这里转成中文，避免登录页只显示英文代号。
     #[must_use]
-    pub fn message(&self) -> &str {
+    pub fn message(&self) -> String {
         match self {
-            Self::Ready => "等待导入策略",
-            Self::Imported(message) | Self::Rejected(message) => message,
-            Self::ServiceUnavailable => "本地守护服务不可用",
+            Self::Ready => "等待导入策略".into(),
+            Self::Imported(reason) => format!("导入成功（{}）", import_reason_text(reason)),
+            Self::Rejected(reason) => format!("导入失败（{}）", import_reason_text(reason)),
+            Self::ServiceUnavailable => "本地守护服务不可用".into(),
         }
     }
+}
+
+/// 把服务返回的导入原因码转成登录页可读的文字。
+fn import_reason_text(reason: &str) -> String {
+    match reason {
+        "accepted" => "策略已生效",
+        "policy_not_found" => "介质根目录没有 anchor-guard.policy",
+        "policy_parse_failed" => "策略文件无法解析",
+        "invalid_signature" => "策略签名无效",
+        "version_not_newer" => "策略版本不高于当前版本",
+        "expired" => "策略已过期",
+        "store_unavailable" => "本地审计库不可用",
+        "audit_write_failed" => "写审计失败",
+        other => other,
+    }
+    .to_string()
 }
 
 /// 最小策略导入 tile 的显示状态与动作。
