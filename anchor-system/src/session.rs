@@ -329,12 +329,21 @@ fn local_interactive_sessions() -> Result<Vec<InteractiveSession>, PlatformError
     }
 
     let sessions = unsafe { std::slice::from_raw_parts(sessions_ptr, count as usize) };
+    // 登录界面也会以活动会话存在，但没有登录用户，此时无法取得用户令牌。
+    // 协作程序只属于已登录用户，按用户名过滤可避免把登录界面误判为故障。
     let result = sessions
         .iter()
-        .filter_map(|session| match session.state {
-            WTS_ACTIVE => Some(InteractiveSession::active(session.session_id)),
-            WTS_CONNECTED => Some(InteractiveSession::connected(session.session_id)),
-            _ => None,
+        .filter_map(|session| {
+            let state = match session.state {
+                WTS_ACTIVE => InteractiveSessionState::Active,
+                WTS_CONNECTED => InteractiveSessionState::Connected,
+                _ => return None,
+            };
+            session_user_name(session.session_id)?;
+            Some(InteractiveSession {
+                id: session.session_id,
+                state,
+            })
         })
         .collect();
     unsafe { wts_free_memory(sessions_ptr.cast()) };
@@ -473,7 +482,7 @@ fn start_local_session_assistant(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_UNICODE_ENVIRONMENT,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             environment,
             current_directory.as_ptr(),
             &mut startup,
@@ -565,6 +574,8 @@ const SECURITY_IMPERSONATION: u32 = 2;
 const TOKEN_PRIMARY: u32 = 1;
 #[cfg(windows)]
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const STILL_ACTIVE: u32 = 259;
 

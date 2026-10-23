@@ -13,10 +13,34 @@ use anchor_system::{
 };
 
 /// 单次本地授权查询的最大等待时间。
-pub const SERVICE_IPC_TIMEOUT: Duration = Duration::from_millis(500);
+pub const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 当前用户会话的授权检查周期。
 pub const AUTHORIZATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 记录导致锁屏的授权拒绝或查询异常；正常轮询不写日志。
+fn record_lock_reason(reason: &str) {
+    use std::io::Write;
+
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join("AnchorGuard").join("session.log");
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{seconds} {reason}");
+    }
+}
 
 /// 向本地守护服务查询当前授权状态的边界。
 pub trait AuthorizationClient {
@@ -73,14 +97,19 @@ where
     }
 
     /// 执行一次授权查询；拒绝、通信错误和无效响应均锁定当前会话。
-    pub fn run_once(&self) -> Result<SessionCheckOutcome, PlatformError> {
+    pub fn run_once(&self) -> Result<SessionCheckOutcome, PlatformError>
+    where
+        C::Error: std::fmt::Display,
+    {
         match self.client.get_authorization(SERVICE_IPC_TIMEOUT) {
             Ok(AuthorizationResponse::Allowed) => Ok(SessionCheckOutcome::Authorized),
-            Ok(AuthorizationResponse::Denied { .. }) => {
+            Ok(AuthorizationResponse::Denied { reason }) => {
+                record_lock_reason(&format!("denied: {reason}"));
                 self.locker.lock_current_session()?;
                 Ok(SessionCheckOutcome::LockedAfterDenied)
             }
-            Err(_) => {
+            Err(error) => {
+                record_lock_reason(&format!("unavailable: {error}"));
                 self.locker.lock_current_session()?;
                 Ok(SessionCheckOutcome::LockedAfterUnavailable)
             }
@@ -88,7 +117,10 @@ where
     }
 
     /// 按固定周期持续检查当前会话授权。
-    pub fn run_forever(&self) -> ! {
+    pub fn run_forever(&self) -> !
+    where
+        C::Error: std::fmt::Display,
+    {
         loop {
             if let Err(error) = self.run_once() {
                 eprintln!("当前会话锁定失败: {error}");

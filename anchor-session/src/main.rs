@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(windows)]
 fn main() {
     use anchor_session::{AnchorPipeAuthorizationClient, SessionAssistant};
