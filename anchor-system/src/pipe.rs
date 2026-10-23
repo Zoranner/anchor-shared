@@ -113,6 +113,7 @@ mod windows {
         ffi::c_void,
         mem::size_of,
         ptr::null,
+        thread,
         time::{Duration, Instant},
     };
 
@@ -123,6 +124,10 @@ mod windows {
 
     const ERROR_IO_PENDING: i32 = 997;
     const ERROR_PIPE_CONNECTED: i32 = 535;
+    const ERROR_OPERATION_ABORTED: i32 = 995;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const SE_KERNEL_OBJECT: i32 = 6;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
     const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -132,8 +137,6 @@ mod windows {
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
     const PIPE_TYPE_BYTE: u32 = 0;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const TOKEN_QUERY: u32 = 0x0008;
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 258;
     const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -155,17 +158,6 @@ mod windows {
         event: isize,
     }
 
-    #[repr(C)]
-    struct SidAndAttributes {
-        sid: *mut c_void,
-        attributes: u32,
-    }
-
-    #[repr(C)]
-    struct TokenUser {
-        user: SidAndAttributes,
-    }
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConnectionWaitOutcome {
         Connected,
@@ -176,6 +168,7 @@ mod windows {
     #[link(name = "advapi32")]
     extern "system" {
         fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> i32;
         fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
             string_security_descriptor: *const u16,
             string_sd_revision: u32,
@@ -183,14 +176,16 @@ mod windows {
             security_descriptor_size: *mut u32,
         ) -> i32;
         fn EqualSid(first_sid: *const c_void, second_sid: *const c_void) -> i32;
-        fn GetTokenInformation(
-            token: isize,
-            token_information_class: u32,
-            token_information: *mut c_void,
-            token_information_length: u32,
-            return_length: *mut u32,
-        ) -> i32;
-        fn OpenProcessToken(process: isize, desired_access: u32, token: *mut isize) -> i32;
+        fn GetSecurityInfo(
+            handle: isize,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            security_descriptor: *mut *mut c_void,
+        ) -> u32;
     }
 
     #[link(name = "kernel32")]
@@ -230,9 +225,8 @@ mod windows {
             bytes_transferred: *mut u32,
             wait: i32,
         ) -> i32;
-        fn GetNamedPipeServerProcessId(named_pipe: isize, server_process_id: *mut u32) -> i32;
+        fn FlushFileBuffers(file: isize) -> i32;
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
-        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn ReadFile(
             file: isize,
             buffer: *mut c_void,
@@ -317,6 +311,8 @@ mod windows {
         let request = read_message_overlapped(pipe.0, deadline)?;
         let response = handler(&request)?;
         write_message_overlapped(pipe.0, &response, deadline)?;
+        // 客户端可能尚未读完响应；先等待数据被取走，再断开，否则响应会被丢弃。
+        unsafe { FlushFileBuffers(pipe.0) };
         unsafe {
             DisconnectNamedPipe(pipe.0);
         }
@@ -330,8 +326,19 @@ mod windows {
     ) -> Result<Vec<u8>, PlatformError> {
         let name = wide(pipe_name)?;
         let deadline = Instant::now() + timeout;
-        if unsafe { WaitNamedPipeW(name.as_ptr(), remaining_timeout(deadline)?) } == 0 {
-            return Err(last_error("等待 Named Pipe 服务超时或失败"));
+        loop {
+            if unsafe { WaitNamedPipeW(name.as_ptr(), remaining_timeout(deadline)?) } != 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            // 服务在处理完一个请求后会短暂关闭实例再重建；这段空隙里管道名不存在，
+            // WaitNamedPipe 会立即失败。它不代表服务不可用，应在截止时间内重试。
+            if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND) {
+                return Err(PlatformError::Failed(format!(
+                    "等待 Named Pipe 服务超时或失败: {error}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
         let client = unsafe {
             CreateFileW(
@@ -403,11 +410,12 @@ mod windows {
                 }) {
                     ConnectionWaitOutcome::Connected => {}
                     ConnectionWaitOutcome::Idle => {
-                        cancel_and_wait(handle, &mut overlapped);
-                        return Ok(false);
+                        // 取消与客户端连接可能同时发生：操作已完成时不能当作空闲关闭，
+                        // 否则客户端会拿到一个马上断开的管道。
+                        return Ok(finish_cancelled_operation(handle, &mut overlapped)?.is_some());
                     }
                     ConnectionWaitOutcome::Failed => {
-                        cancel_and_wait(handle, &mut overlapped);
+                        let _ = finish_cancelled_operation(handle, &mut overlapped);
                         return Err(last_error("等待 Named Pipe 客户端失败"));
                     }
                 }
@@ -422,52 +430,71 @@ mod windows {
     }
 
     fn verify_server_is_local_system(handle: isize) -> Result<(), PlatformError> {
-        let mut process_id = 0;
-        if unsafe { GetNamedPipeServerProcessId(handle, &mut process_id) } == 0 || process_id == 0 {
-            return Err(last_error("读取 Named Pipe 服务进程失败"));
-        }
-        let process =
-            Handle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) })?;
-        let mut token = 0;
-        if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } == 0 {
-            return Err(last_error("读取 Named Pipe 服务令牌失败"));
-        }
-        let token = Handle::new(token)?;
-
-        let mut length = 0;
-        unsafe {
-            GetTokenInformation(token.0, 1, std::ptr::null_mut(), 0, &mut length);
-        }
-        if length < size_of::<TokenUser>() as u32 {
-            return Err(last_error("读取 Named Pipe 服务 SID 长度失败"));
-        }
-        let mut information = vec![0_u8; length as usize];
-        if unsafe {
-            GetTokenInformation(
-                token.0,
-                1,
-                information.as_mut_ptr().cast(),
-                length,
-                &mut length,
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // 直接读取管道对象的所有者：普通用户令牌通常无法打开 SYSTEM 服务进程，
+        // 用进程令牌校验会把合法客户端误判成拒绝访问。
+        let result = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
             )
-        } == 0
-        {
-            return Err(last_error("读取 Named Pipe 服务 SID 失败"));
+        };
+        if result != 0 {
+            return Err(PlatformError::Failed(format!(
+                "读取 Named Pipe 所有者失败: {}",
+                std::io::Error::from_raw_os_error(result as i32)
+            )));
         }
-        let token_user = unsafe { &*information.as_ptr().cast::<TokenUser>() };
+        let _descriptor = SecurityDescriptor(descriptor);
+        if owner.is_null() {
+            return Err(PlatformError::Failed("Named Pipe 没有所有者".into()));
+        }
 
-        let system_sid = wide_nul("S-1-5-18");
-        let mut expected_sid = std::ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(system_sid.as_ptr(), &mut expected_sid) } == 0 {
-            return Err(last_error("生成 LocalSystem SID 失败"));
-        }
-        let expected_sid = SecurityDescriptor(expected_sid);
-        if unsafe { EqualSid(token_user.user.sid, expected_sid.0) } == 0 {
-            return Err(PlatformError::Failed(
-                "拒绝非 LocalSystem 的 Named Pipe 服务端".into(),
-            ));
+        if !trusted_server_owner(owner) {
+            return Err(PlatformError::Failed(format!(
+                "拒绝非系统身份的 Named Pipe 服务端: {}",
+                sid_to_string(owner)
+            )));
         }
         Ok(())
+    }
+
+    fn trusted_server_owner(owner: *mut c_void) -> bool {
+        for name in ["S-1-5-18", "S-1-5-32-544"] {
+            let name = wide_nul(name);
+            let mut expected = std::ptr::null_mut();
+            if unsafe { ConvertStringSidToSidW(name.as_ptr(), &mut expected) } == 0 {
+                continue;
+            }
+            let expected = SecurityDescriptor(expected);
+            if unsafe { EqualSid(owner, expected.0) } != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn sid_to_string(sid: *mut c_void) -> String {
+        let mut text = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return "?".into();
+        }
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        unsafe {
+            LocalFree(text.cast());
+        }
+        value
     }
 
     fn read_message_overlapped(handle: isize, deadline: Instant) -> Result<Vec<u8>, PlatformError> {
@@ -589,13 +616,15 @@ mod windows {
         let wait_timeout = match remaining_timeout(deadline) {
             Ok(timeout) => timeout,
             Err(error) => {
-                cancel_and_wait(handle, overlapped);
+                let _ = finish_cancelled_operation(handle, overlapped);
                 return Err(error);
             }
         };
         if unsafe { WaitForSingleObject(overlapped.event, wait_timeout) } != WAIT_OBJECT_0 {
-            cancel_and_wait(handle, overlapped);
-            return Err(PlatformError::Failed("Named Pipe 调用超时".into()));
+            return match finish_cancelled_operation(handle, overlapped)? {
+                Some(bytes) => Ok(bytes),
+                None => Err(PlatformError::Failed("Named Pipe 调用超时".into())),
+            };
         }
         let mut bytes = 0;
         if unsafe { GetOverlappedResult(handle, overlapped, &mut bytes, 0) } == 0 {
@@ -604,11 +633,22 @@ mod windows {
         Ok(bytes as usize)
     }
 
-    fn cancel_and_wait(handle: isize, overlapped: &mut Overlapped) {
-        unsafe {
-            CancelIoEx(handle, overlapped);
-            GetOverlappedResult(handle, overlapped, std::ptr::null_mut(), 1);
+    fn finish_cancelled_operation(
+        handle: isize,
+        overlapped: &mut Overlapped,
+    ) -> Result<Option<usize>, PlatformError> {
+        let mut bytes = 0;
+        unsafe { CancelIoEx(handle, overlapped) };
+        if unsafe { GetOverlappedResult(handle, overlapped, &mut bytes, 1) } != 0 {
+            return Ok(Some(bytes as usize));
         }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED) {
+            return Ok(None);
+        }
+        Err(PlatformError::Failed(format!(
+            "取消 Named Pipe 操作失败: {error}"
+        )))
     }
 
     fn connection_wait_outcome(status: u32) -> ConnectionWaitOutcome {
@@ -646,9 +686,12 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::{
-            connection_wait_outcome, security_descriptor_wide, ConnectionWaitOutcome, WAIT_TIMEOUT,
+            connect_named_pipe, connection_wait_outcome, security_descriptor_wide, wide_nul,
+            ConnectionWaitOutcome, CreateNamedPipeW, Handle, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE,
+            WAIT_TIMEOUT,
         };
         use crate::pipe::session_status_client_sddl;
+        use std::time::Duration;
 
         #[test]
         fn failed_connection_wait_is_not_treated_as_an_idle_listener() {
@@ -670,6 +713,31 @@ mod windows {
                 String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
                 session_status_client_sddl()
             );
+        }
+
+        #[test]
+        fn idle_connect_timeout_cancels_without_a_null_byte_count() {
+            let name = wide_nul(&format!(
+                r"\\.\pipe\AnchorGuard.PipeTest.{}",
+                std::process::id()
+            ));
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | super::FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_BYTE,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            let pipe = Handle::new(pipe).unwrap();
+
+            let connected = connect_named_pipe(pipe.0, Duration::from_millis(50)).unwrap();
+
+            assert!(!connected);
         }
     }
 }

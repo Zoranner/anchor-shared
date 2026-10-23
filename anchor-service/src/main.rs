@@ -58,6 +58,8 @@ use windows_service::{
 const SERVICE_NAME: &str = "AnchorGuard";
 /// 设备处置失败后的重试间隔。
 const LISTEN_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
+/// 管道实例重建失败后的重试间隔；关闭与重建之间本就有短暂空窗，退避过长会让客户端误判服务不可用。
+const PIPE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// 设备状态与策略期望的核对周期。观测状态已符合策略的设备不会产生任何处置或审计。
 const ENFORCEMENT_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
@@ -160,7 +162,7 @@ where
     thread::spawn(move || {
         while !stop_requested.load(Ordering::SeqCst) {
             if serve_once(&service, Utc::now()).is_err() {
-                thread::sleep(LISTEN_FAILURE_BACKOFF);
+                thread::sleep(PIPE_RETRY_BACKOFF);
             }
         }
     })
