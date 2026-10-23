@@ -2,6 +2,9 @@ pub mod controller;
 pub mod filter;
 
 #[cfg(windows)]
+mod icon;
+
+#[cfg(windows)]
 pub mod native;
 
 pub use controller::{
@@ -91,7 +94,9 @@ mod controller_tests {
 
         let status = controller.import_from_policy_media(&mut credentials_changed);
 
-        assert_eq!(status.message(), "导入成功（imported）");
+        assert_eq!(status.message(), "导入成功，正在恢复登录");
+        assert_eq!(status.link_label(), "确认");
+        assert!(status.needs_confirmation());
         assert_eq!(credentials_changed.count, 1);
         assert_eq!(
             *transport.requests.lock().unwrap(),
@@ -99,7 +104,7 @@ mod controller_tests {
         );
         assert_eq!(
             *transport.timeouts.lock().unwrap(),
-            vec![Duration::from_millis(500)]
+            vec![crate::controller::SERVICE_IPC_TIMEOUT]
         );
     }
 
@@ -115,8 +120,19 @@ mod controller_tests {
 
         tile.import_from_policy_media(&mut credentials_changed);
 
-        assert_eq!(tile.status().message(), "导入失败（策略签名无效）");
+        assert_eq!(tile.status().message(), "导入失败：策略签名无效");
+        assert_eq!(tile.status().link_label(), "确认");
+        assert!(tile.status().needs_confirmation());
         assert_eq!(credentials_changed.count, 0);
+    }
+
+    #[test]
+    fn ready_status_shows_the_import_button() {
+        let status = super::ImportTileStatus::Ready;
+
+        assert_eq!(status.message(), "等待导入策略");
+        assert_eq!(status.link_label(), "导入策略");
+        assert!(!status.needs_confirmation());
     }
 
     #[test]

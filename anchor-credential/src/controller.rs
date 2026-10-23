@@ -7,7 +7,7 @@ use anchor_system::pipe::{transact, DEFAULT_CONTROL_PIPE};
 use crate::filter::filter_provider_ids;
 
 /// Credential Provider 调用本地守护服务的最大等待时间。
-pub const SERVICE_IPC_TIMEOUT: Duration = Duration::from_millis(500);
+pub const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 本地守护服务的最小调用边界。
 ///
@@ -64,10 +64,25 @@ impl ImportTileStatus {
     pub fn message(&self) -> String {
         match self {
             Self::Ready => "等待导入策略".into(),
-            Self::Imported(reason) => format!("导入成功（{}）", import_reason_text(reason)),
-            Self::Rejected(reason) => format!("导入失败（{}）", import_reason_text(reason)),
-            Self::ServiceUnavailable => "本地守护服务不可用".into(),
+            Self::Imported(_) => "导入成功，正在恢复登录".into(),
+            Self::Rejected(reason) => format!("导入失败：{}", import_reason_text(reason)),
+            Self::ServiceUnavailable => "导入失败：本地服务不可用".into(),
         }
+    }
+
+    /// 下方命令按钮的文字；失败或成功后变成“确认”，点击后回到初始状态。
+    #[must_use]
+    pub const fn link_label(&self) -> &'static str {
+        match self {
+            Self::Ready => "导入策略",
+            Self::Imported(_) | Self::Rejected(_) | Self::ServiceUnavailable => "确认",
+        }
+    }
+
+    /// 当前是否处于“报错/结果 + 确认”状态。
+    #[must_use]
+    pub const fn needs_confirmation(&self) -> bool {
+        !matches!(self, Self::Ready)
     }
 }
 
@@ -75,14 +90,14 @@ impl ImportTileStatus {
 fn import_reason_text(reason: &str) -> String {
     match reason {
         "accepted" => "策略已生效",
-        "policy_not_found" => "介质根目录没有 anchor-guard.policy",
-        "policy_parse_failed" => "策略文件无法解析",
+        "policy_not_found" => "未找到策略文件",
+        "policy_parse_failed" => "策略文件格式错误",
         "invalid_signature" => "策略签名无效",
-        "version_not_newer" => "策略版本不高于当前版本",
+        "version_not_newer" => "版本不高于当前版本",
         "expired" => "策略已过期",
         "store_unavailable" => "本地审计库不可用",
-        "audit_write_failed" => "写审计失败",
-        other => other,
+        "audit_write_failed" => "无法写入审计记录",
+        _ => "未知错误",
     }
     .to_string()
 }

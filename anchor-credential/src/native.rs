@@ -8,6 +8,7 @@ use std::{
     mem::{size_of, zeroed},
     ptr::null_mut,
     rc::Rc,
+    time::Duration,
 };
 
 use windows::{
@@ -23,11 +24,12 @@ use windows::{
             ICredentialProviderCredentialEvents, ICredentialProviderCredential_Impl,
             ICredentialProviderEvents, ICredentialProviderFilter_Impl, ICredentialProvider_Impl,
             CPFIS_FOCUSED, CPFIS_NONE, CPFS_DISPLAY_IN_SELECTED_TILE, CPFT_COMMAND_LINK,
-            CPFT_LARGE_TEXT, CPFT_SMALL_TEXT, CPGSR_NO_CREDENTIAL_NOT_FINISHED, CPSI_NONE,
-            CPUS_LOGON, CPUS_UNLOCK_WORKSTATION, CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION,
-            CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR, CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE,
-            CREDENTIAL_PROVIDER_FIELD_STATE, CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE,
-            CREDENTIAL_PROVIDER_STATUS_ICON, CREDENTIAL_PROVIDER_USAGE_SCENARIO,
+            CPFT_LARGE_TEXT, CPFT_SMALL_TEXT, CPFT_TILE_IMAGE, CPGSR_NO_CREDENTIAL_NOT_FINISHED,
+            CPSI_NONE, CPUS_LOGON, CPUS_UNLOCK_WORKSTATION,
+            CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION, CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR,
+            CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE, CREDENTIAL_PROVIDER_FIELD_STATE,
+            CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE, CREDENTIAL_PROVIDER_STATUS_ICON,
+            CREDENTIAL_PROVIDER_USAGE_SCENARIO,
         },
     },
 };
@@ -254,7 +256,7 @@ impl ICredentialProvider_Impl for AnchorImportProvider_Impl {
     }
 
     fn GetFieldDescriptorCount(&self) -> Result<u32> {
-        Ok(3)
+        Ok(4)
     }
 
     fn GetFieldDescriptorAt(
@@ -262,9 +264,10 @@ impl ICredentialProvider_Impl for AnchorImportProvider_Impl {
         dwindex: u32,
     ) -> Result<*mut CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR> {
         let (cpft, label) = match dwindex {
-            0 => (CPFT_LARGE_TEXT, "Anchor Guard"),
-            1 => (CPFT_SMALL_TEXT, "等待导入策略"),
-            2 => (CPFT_COMMAND_LINK, "导入策略"),
+            0 => (CPFT_TILE_IMAGE, ""),
+            1 => (CPFT_LARGE_TEXT, "Anchor Guard"),
+            2 => (CPFT_SMALL_TEXT, "等待导入策略"),
+            3 => (CPFT_COMMAND_LINK, self.status.borrow().link_label()),
             _ => return Err(Error::from(E_INVALIDARG)),
         };
         allocate_descriptor(dwindex, cpft, label)
@@ -350,12 +353,12 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
         pcpfs: *mut CREDENTIAL_PROVIDER_FIELD_STATE,
         pcpfis: *mut CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE,
     ) -> Result<()> {
-        if pcpfs.is_null() || pcpfis.is_null() || dwfieldid > 2 {
+        if pcpfs.is_null() || pcpfis.is_null() || dwfieldid > 3 {
             return Err(Error::from(E_INVALIDARG));
         }
         unsafe {
             *pcpfs = CPFS_DISPLAY_IN_SELECTED_TILE;
-            *pcpfis = if dwfieldid == 2 {
+            *pcpfis = if dwfieldid == 3 {
                 CPFIS_FOCUSED
             } else {
                 CPFIS_NONE
@@ -366,16 +369,20 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
 
     fn GetStringValue(&self, dwfieldid: u32) -> Result<PWSTR> {
         let value = match dwfieldid {
-            0 => "Anchor Guard".to_string(),
-            1 => self.status.borrow().message(),
-            2 => "导入策略".to_string(),
+            1 => "Anchor Guard".to_string(),
+            2 => self.status.borrow().message(),
+            3 => self.status.borrow().link_label().to_string(),
             _ => return Err(Error::from(E_INVALIDARG)),
         };
         allocate_wide_string(&value)
     }
 
-    fn GetBitmapValue(&self, _dwfieldid: u32) -> Result<HBITMAP> {
-        Err(Error::from(E_NOTIMPL))
+    fn GetBitmapValue(&self, dwfieldid: u32) -> Result<HBITMAP> {
+        if dwfieldid == 0 {
+            crate::icon::tile_bitmap()
+        } else {
+            Err(Error::from(E_NOTIMPL))
+        }
     }
 
     fn GetCheckboxValue(
@@ -417,16 +424,25 @@ impl ICredentialProviderCredential_Impl for AnchorImportCredential_Impl {
     }
 
     fn CommandLinkClicked(&self, dwfieldid: u32) -> Result<()> {
-        if dwfieldid != 2 {
+        if dwfieldid != 3 {
             return Err(Error::from(E_INVALIDARG));
         }
         let mut notifier = ProviderEventsChanged {
             events: self.provider_events.borrow().clone(),
             advise_context: self.advise_context.get(),
         };
+        if self.status.borrow().needs_confirmation() {
+            *self.status.borrow_mut() = ImportTileStatus::Ready;
+            notifier.credentials_changed();
+            return Ok(());
+        }
+        let providers_were_hidden = !self.controller.allows_system_providers();
         *self.status.borrow_mut() = self.controller.import_from_policy_media(&mut notifier);
         // 成功和失败都要让登录页重新枚举：成功时系统登录项回来，失败时显示原因。
         notifier.credentials_changed();
+        if should_refresh_logon_ui(providers_were_hidden, &self.status.borrow()) {
+            refresh_logon_ui();
+        }
         Ok(())
     }
 
@@ -477,6 +493,34 @@ impl CredentialsChanged for ProviderEventsChanged {
     }
 }
 
+/// 策略导入成功且此前系统登录项被隐藏时，需要重建登录界面。
+///
+/// LogonUI 只在初始化登录场景时执行 Provider 过滤，导入成功后的
+/// `CredentialsChanged` 不会重新跑过滤，系统密码项因此不会自己回来。
+fn should_refresh_logon_ui(providers_were_hidden: bool, status: &ImportTileStatus) -> bool {
+    providers_were_hidden && matches!(status, ImportTileStatus::Imported(_))
+}
+
+/// 重启当前登录界面进程，让 LogonUI 重新枚举并执行 Provider 过滤。
+///
+/// 只在 DLL 由 LogonUI 加载时执行；延迟退出是为了先把导入结果返回给界面。
+fn refresh_logon_ui() {
+    let is_logon_ui = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|name| name.eq_ignore_ascii_case("LogonUI.exe"));
+    if !is_logon_ui {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(1200));
+        std::process::exit(0);
+    });
+}
+
 fn allocate_descriptor(
     field_id: u32,
     field_type: windows::Win32::UI::Shell::CREDENTIAL_PROVIDER_FIELD_TYPE,
@@ -513,7 +557,11 @@ fn allocate_wide_string(value: &str) -> Result<PWSTR> {
 
 #[cfg(test)]
 mod tests {
-    use super::{class_factory_for, supports_class, ANCHOR_FILTER_GUID, ANCHOR_PROVIDER_GUID};
+    use super::{
+        class_factory_for, should_refresh_logon_ui, supports_class, ANCHOR_FILTER_GUID,
+        ANCHOR_PROVIDER_GUID,
+    };
+    use crate::ImportTileStatus;
     use windows::core::GUID;
 
     #[test]
@@ -528,5 +576,22 @@ mod tests {
         assert!(class_factory_for(&ANCHOR_PROVIDER_GUID).is_ok());
         assert!(class_factory_for(&ANCHOR_FILTER_GUID).is_ok());
         assert!(class_factory_for(&GUID::zeroed()).is_err());
+    }
+
+    #[test]
+    fn logon_ui_refresh_runs_only_after_a_successful_import_that_was_hidden() {
+        assert!(should_refresh_logon_ui(
+            true,
+            &ImportTileStatus::Imported("accepted".into())
+        ));
+        assert!(!should_refresh_logon_ui(
+            false,
+            &ImportTileStatus::Imported("accepted".into())
+        ));
+        assert!(!should_refresh_logon_ui(
+            true,
+            &ImportTileStatus::Rejected("expired".into())
+        ));
+        assert!(!should_refresh_logon_ui(true, &ImportTileStatus::Ready));
     }
 }
