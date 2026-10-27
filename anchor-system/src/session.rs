@@ -133,6 +133,16 @@ pub trait SessionAssistantLauncherBackend {
 
     /// 释放进程句柄；不会终止用户会话中的协作程序。
     fn release_session_assistant(&self, process: SessionAssistantProcess);
+
+    /// 判断指定会话中是否已有桌面端进程。
+    fn desktop_running(
+        &self,
+        session_id: u32,
+        executable_name: &str,
+    ) -> Result<bool, PlatformError>;
+
+    /// 以指定会话用户身份启动桌面端；只负责启动，不保存长期句柄。
+    fn start_desktop(&self, session_id: u32, executable: &Path) -> Result<(), PlatformError>;
 }
 
 /// 一轮协作程序会话协调的结果。
@@ -250,6 +260,37 @@ impl<B: SessionAssistantLauncherBackend> Drop for SessionAssistantLauncher<B> {
     }
 }
 
+/// 协调每个交互会话中唯一的桌面端进程。
+pub struct DesktopLauncher<B: SessionAssistantLauncherBackend> {
+    backend: B,
+    executable: PathBuf,
+}
+
+impl<B: SessionAssistantLauncherBackend> DesktopLauncher<B> {
+    pub fn new(backend: B, executable: impl Into<PathBuf>) -> Self {
+        Self {
+            backend,
+            executable: executable.into(),
+        }
+    }
+
+    /// 返回本轮实际启动桌面端的会话。
+    pub fn reconcile(&mut self) -> Result<Vec<u32>, PlatformError> {
+        let mut started = Vec::new();
+        for session in self.backend.interactive_sessions()? {
+            if self
+                .backend
+                .desktop_running(session.id, "anchor-guard.exe")?
+            {
+                continue;
+            }
+            self.backend.start_desktop(session.id, &self.executable)?;
+            started.push(session.id);
+        }
+        Ok(started)
+    }
+}
+
 /// 当前平台的会话枚举与协作程序启动后端。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalSessionAssistantBackend;
@@ -276,6 +317,20 @@ impl SessionAssistantLauncherBackend for LocalSessionAssistantBackend {
 
     fn release_session_assistant(&self, process: SessionAssistantProcess) {
         release_local_session_assistant(process);
+    }
+
+    fn desktop_running(
+        &self,
+        session_id: u32,
+        executable_name: &str,
+    ) -> Result<bool, PlatformError> {
+        desktop_running(session_id, executable_name)
+    }
+
+    fn start_desktop(&self, session_id: u32, executable: &Path) -> Result<(), PlatformError> {
+        let process = start_local_session_assistant(session_id, executable)?;
+        release_local_session_assistant(process);
+        Ok(())
     }
 }
 
@@ -519,6 +574,54 @@ fn local_session_assistant_running(
     Ok(exit_code == STILL_ACTIVE)
 }
 
+#[cfg(windows)]
+fn desktop_running(session_id: u32, executable_name: &str) -> Result<bool, PlatformError> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|error| PlatformError::Failed(format!("枚举桌面端进程失败: {error}")))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        let mut found = false;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if name.eq_ignore_ascii_case(executable_name) {
+                    let mut process_session = 0;
+                    if process_id_to_session_id(entry.th32ProcessID, &mut process_session) != 0
+                        && process_session == session_id
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        Ok(found)
+    }
+}
+
+#[cfg(not(windows))]
+fn desktop_running(_session_id: u32, _executable_name: &str) -> Result<bool, PlatformError> {
+    Err(PlatformError::Unsupported("Windows desktop process query"))
+}
+
 #[cfg(not(windows))]
 fn local_session_assistant_running(
     _process: SessionAssistantProcess,
@@ -694,6 +797,8 @@ extern "system" {
     fn close_handle(handle: isize) -> i32;
     #[link_name = "GetExitCodeProcess"]
     fn get_exit_code_process(process: isize, exit_code: *mut u32) -> i32;
+    #[link_name = "ProcessIdToSessionId"]
+    fn process_id_to_session_id(process_id: u32, session_id: *mut u32) -> i32;
 }
 
 #[cfg(windows)]
@@ -723,8 +828,8 @@ mod tests {
     use std::{cell::RefCell, collections::BTreeSet, path::Path};
 
     use super::{
-        InteractiveSession, SessionAssistantLauncher, SessionAssistantLauncherBackend,
-        SessionAssistantProcess,
+        DesktopLauncher, InteractiveSession, SessionAssistantLauncher,
+        SessionAssistantLauncherBackend, SessionAssistantProcess,
     };
 
     #[derive(Default)]
@@ -734,6 +839,8 @@ mod tests {
         running: RefCell<BTreeSet<SessionAssistantProcess>>,
         starts: RefCell<Vec<(u32, String)>>,
         released: RefCell<Vec<SessionAssistantProcess>>,
+        desktop_running: RefCell<BTreeSet<u32>>,
+        desktop_starts: RefCell<Vec<u32>>,
     }
 
     impl TestLauncherBackend {
@@ -781,6 +888,38 @@ mod tests {
         fn release_session_assistant(&self, process: SessionAssistantProcess) {
             self.released.borrow_mut().push(process);
         }
+
+        fn desktop_running(
+            &self,
+            session_id: u32,
+            _executable_name: &str,
+        ) -> Result<bool, crate::error::PlatformError> {
+            Ok(self.desktop_running.borrow().contains(&session_id))
+        }
+
+        fn start_desktop(
+            &self,
+            session_id: u32,
+            _executable: &Path,
+        ) -> Result<(), crate::error::PlatformError> {
+            self.desktop_starts.borrow_mut().push(session_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn desktop_launcher_starts_only_missing_sessions() {
+        let backend = TestLauncherBackend::with_sessions(vec![
+            InteractiveSession::active(1),
+            InteractiveSession::active(2),
+        ]);
+        backend.desktop_running.borrow_mut().insert(1);
+        let mut launcher = DesktopLauncher::new(backend, "anchor-guard.exe");
+
+        let started = launcher.reconcile().unwrap();
+
+        assert_eq!(started, vec![2]);
+        assert_eq!(launcher.backend.desktop_starts.borrow().as_slice(), &[2]);
     }
 
     #[test]

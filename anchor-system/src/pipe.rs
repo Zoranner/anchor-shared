@@ -6,15 +6,20 @@ use crate::error::PlatformError;
 
 /// 单条本地控制消息的最大字节数，与服务协议的限制一致。
 pub const MAX_PIPE_MESSAGE_BYTES: usize = 64 * 1024;
+/// 桌面端管道允许的单条消息上限，覆盖策略包和审计页响应。
+pub const MAX_DESKTOP_PIPE_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Anchor Guard 服务的固定本地端点。
 pub const DEFAULT_CONTROL_PIPE: &str = r"\\.\pipe\AnchorGuard.Control";
 
 /// 供当前用户会话查询授权状态的固定本地端点。
 pub const SESSION_STATUS_PIPE: &str = r"\\.\pipe\AnchorGuard.SessionStatus";
+/// 供已登录用户桌面端查询状态、导入策略和查看审计的固定本地端点。
+pub const DESKTOP_PIPE: &str = r"\\.\pipe\AnchorGuard.Desktop";
 
 const CONTROLLED_CLIENT_SDDL: &str = "D:P(A;;GA;;;SY)";
 const SESSION_STATUS_CLIENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)";
+const DESKTOP_CLIENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)";
 
 /// 服务端一次监听的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +47,15 @@ pub const fn session_status_client_sddl() -> &'static str {
     SESSION_STATUS_CLIENT_SDDL
 }
 
+/// 返回桌面端端点使用的访问控制描述符。
+///
+/// 与会话状态端点相同：`SYSTEM` 全权，已认证用户可读写；调用端仍需验证服务端为
+/// LocalSystem。
+#[must_use]
+pub const fn desktop_client_sddl() -> &'static str {
+    DESKTOP_CLIENT_SDDL
+}
+
 /// 判断字符串是否为 Windows 本地 Named Pipe 路径。
 #[must_use]
 pub fn is_named_pipe_path(path: &str) -> bool {
@@ -57,7 +71,12 @@ pub fn serve_once<F>(pipe_name: &str, handler: F) -> Result<PipeServeOutcome, Pl
 where
     F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
 {
-    windows::serve_once(pipe_name, controlled_client_sddl(), handler)
+    windows::serve_once(
+        pipe_name,
+        controlled_client_sddl(),
+        MAX_PIPE_MESSAGE_BYTES,
+        handler,
+    )
 }
 
 /// 非 Windows 平台没有可支持的本地登录管控端点。
@@ -75,12 +94,40 @@ pub fn serve_session_status_once<F>(handler: F) -> Result<PipeServeOutcome, Plat
 where
     F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
 {
-    windows::serve_once(SESSION_STATUS_PIPE, session_status_client_sddl(), handler)
+    windows::serve_once(
+        SESSION_STATUS_PIPE,
+        session_status_client_sddl(),
+        MAX_PIPE_MESSAGE_BYTES,
+        handler,
+    )
 }
 
 /// 非 Windows 平台没有可支持的本地会话状态端点。
 #[cfg(not(windows))]
 pub fn serve_session_status_once<F>(_handler: F) -> Result<PipeServeOutcome, PlatformError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
+{
+    Err(PlatformError::Unsupported("Windows Named Pipe"))
+}
+
+/// 服务端处理一次桌面端请求。
+#[cfg(windows)]
+pub fn serve_desktop_once<F>(handler: F) -> Result<PipeServeOutcome, PlatformError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
+{
+    windows::serve_once(
+        DESKTOP_PIPE,
+        desktop_client_sddl(),
+        MAX_DESKTOP_PIPE_MESSAGE_BYTES,
+        handler,
+    )
+}
+
+/// 非 Windows 平台没有可支持的桌面端端点。
+#[cfg(not(windows))]
+pub fn serve_desktop_once<F>(_handler: F) -> Result<PipeServeOutcome, PlatformError>
 where
     F: FnOnce(&[u8]) -> Result<Vec<u8>, PlatformError>,
 {
@@ -94,7 +141,7 @@ pub fn transact(
     request: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, PlatformError> {
-    windows::transact(pipe_name, request, timeout)
+    windows::transact(pipe_name, request, timeout, MAX_PIPE_MESSAGE_BYTES)
 }
 
 /// 非 Windows 平台没有可支持的本地登录管控端点。
@@ -104,6 +151,23 @@ pub fn transact(
     _request: &[u8],
     _timeout: Duration,
 ) -> Result<Vec<u8>, PlatformError> {
+    Err(PlatformError::Unsupported("Windows Named Pipe"))
+}
+
+/// 向桌面端本地服务发出一次请求并等待回复。
+#[cfg(windows)]
+pub fn transact_desktop(request: &[u8], timeout: Duration) -> Result<Vec<u8>, PlatformError> {
+    windows::transact(
+        DESKTOP_PIPE,
+        request,
+        timeout,
+        MAX_DESKTOP_PIPE_MESSAGE_BYTES,
+    )
+}
+
+/// 非 Windows 平台没有可支持的桌面端端点。
+#[cfg(not(windows))]
+pub fn transact_desktop(_request: &[u8], _timeout: Duration) -> Result<Vec<u8>, PlatformError> {
     Err(PlatformError::Unsupported("Windows Named Pipe"))
 }
 
@@ -119,7 +183,7 @@ mod windows {
 
     use crate::{
         error::PlatformError,
-        pipe::{is_named_pipe_path, PipeServeOutcome, MAX_PIPE_MESSAGE_BYTES},
+        pipe::{is_named_pipe_path, PipeServeOutcome},
     };
 
     const ERROR_IO_PENDING: i32 = 997;
@@ -277,6 +341,7 @@ mod windows {
     pub(super) fn serve_once<F>(
         pipe_name: &str,
         client_sddl: &str,
+        max_message_bytes: usize,
         handler: F,
     ) -> Result<PipeServeOutcome, PlatformError>
     where
@@ -295,8 +360,8 @@ mod windows {
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                MAX_PIPE_MESSAGE_BYTES as u32,
-                MAX_PIPE_MESSAGE_BYTES as u32,
+                max_message_bytes as u32,
+                max_message_bytes as u32,
                 0,
                 &attributes,
             )
@@ -308,9 +373,9 @@ mod windows {
         }
 
         let deadline = Instant::now() + SERVER_IO_TIMEOUT;
-        let request = read_message_overlapped(pipe.0, deadline)?;
+        let request = read_message_overlapped(pipe.0, deadline, max_message_bytes)?;
         let response = handler(&request)?;
-        write_message_overlapped(pipe.0, &response, deadline)?;
+        write_message_overlapped(pipe.0, &response, deadline, max_message_bytes)?;
         // 客户端可能尚未读完响应；先等待数据被取走，再断开，否则响应会被丢弃。
         unsafe { FlushFileBuffers(pipe.0) };
         unsafe {
@@ -323,6 +388,7 @@ mod windows {
         pipe_name: &str,
         request: &[u8],
         timeout: Duration,
+        max_message_bytes: usize,
     ) -> Result<Vec<u8>, PlatformError> {
         let name = wide(pipe_name)?;
         let deadline = Instant::now() + timeout;
@@ -354,8 +420,8 @@ mod windows {
         let client = Handle::new(client)?;
         verify_server_is_local_system(client.0)?;
 
-        write_message_overlapped(client.0, request, deadline)?;
-        read_message_overlapped(client.0, deadline)
+        write_message_overlapped(client.0, request, deadline, max_message_bytes)?;
+        read_message_overlapped(client.0, deadline, max_message_bytes)
     }
 
     fn security_descriptor(client_sddl: &str) -> Result<SecurityDescriptor, PlatformError> {
@@ -497,11 +563,15 @@ mod windows {
         value
     }
 
-    fn read_message_overlapped(handle: isize, deadline: Instant) -> Result<Vec<u8>, PlatformError> {
+    fn read_message_overlapped(
+        handle: isize,
+        deadline: Instant,
+        max_message_bytes: usize,
+    ) -> Result<Vec<u8>, PlatformError> {
         let mut header = [0_u8; 4];
         read_exact_overlapped(handle, &mut header, deadline)?;
         let length = u32::from_le_bytes(header) as usize;
-        let mut payload = vec![0; checked_message_length(length)?];
+        let mut payload = vec![0; checked_message_length(length, max_message_bytes)?];
         read_exact_overlapped(handle, &mut payload, deadline)?;
         Ok(payload)
     }
@@ -510,8 +580,9 @@ mod windows {
         handle: isize,
         message: &[u8],
         deadline: Instant,
+        max_message_bytes: usize,
     ) -> Result<(), PlatformError> {
-        let length = checked_message_length(message.len())? as u32;
+        let length = checked_message_length(message.len(), max_message_bytes)? as u32;
         write_all_overlapped(handle, &length.to_le_bytes(), deadline)?;
         write_all_overlapped(handle, message, deadline)
     }
@@ -666,10 +737,13 @@ mod windows {
         Ok(timeout_millis(remaining))
     }
 
-    fn checked_message_length(length: usize) -> Result<usize, PlatformError> {
-        if length > MAX_PIPE_MESSAGE_BYTES {
+    fn checked_message_length(
+        length: usize,
+        max_message_bytes: usize,
+    ) -> Result<usize, PlatformError> {
+        if length > max_message_bytes {
             return Err(PlatformError::Failed(format!(
-                "Named Pipe 消息超过 {MAX_PIPE_MESSAGE_BYTES} 字节上限"
+                "Named Pipe 消息超过 {max_message_bytes} 字节上限"
             )));
         }
         Ok(length)
@@ -745,7 +819,8 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::{
-        controlled_client_sddl, is_named_pipe_path, session_status_client_sddl,
+        controlled_client_sddl, desktop_client_sddl, is_named_pipe_path,
+        session_status_client_sddl, DESKTOP_PIPE, MAX_DESKTOP_PIPE_MESSAGE_BYTES,
         MAX_PIPE_MESSAGE_BYTES,
     };
 
@@ -772,5 +847,12 @@ mod tests {
     #[test]
     fn control_pipe_message_limit_matches_the_service_protocol_limit() {
         assert_eq!(MAX_PIPE_MESSAGE_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn desktop_pipe_is_available_to_authenticated_users_only() {
+        assert_eq!(desktop_client_sddl(), "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)");
+        assert_eq!(DESKTOP_PIPE, r"\\.\pipe\AnchorGuard.Desktop");
+        assert_eq!(MAX_DESKTOP_PIPE_MESSAGE_BYTES, 1024 * 1024);
     }
 }
