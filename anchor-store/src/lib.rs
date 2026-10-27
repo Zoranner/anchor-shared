@@ -4,7 +4,7 @@ mod error;
 mod types;
 
 pub use error::StoreError;
-pub use types::{DeviceStateRecord, EventFilter, ScanRecord, ScanStatus};
+pub use types::{ActivePolicyRecord, DeviceStateRecord, EventFilter, ScanRecord, ScanStatus};
 
 use std::path::Path;
 use std::sync::{
@@ -201,6 +201,31 @@ impl Store {
             .optional()?;
         package
             .map(|json| serde_json::from_str(&json).map_err(StoreError::from))
+            .transpose()
+    }
+
+    /// 返回当前活动策略和导入时间；没有活动策略时返回 None。
+    pub fn active_policy_record(&self) -> Result<Option<ActivePolicyRecord>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let record = connection
+            .query_row(
+                "SELECT package_json, imported_at FROM policies WHERE active = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        record
+            .map(|(json, imported_at)| {
+                Ok(ActivePolicyRecord {
+                    package: serde_json::from_str(&json)?,
+                    imported_at: DateTime::parse_from_rfc3339(&imported_at)
+                        .map_err(|_| StoreError::TimeParse(imported_at))?
+                        .with_timezone(&Utc),
+                })
+            })
             .transpose()
     }
 
@@ -676,6 +701,72 @@ impl Store {
         Ok(events)
     }
 
+    /// 按游标分页查询审计事件；`after_sequence` 为上一页最后一条事件的序号。
+    pub fn query_audit_page(
+        &self,
+        filter: &EventFilter,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<(i64, AuditEvent)>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let mut sql = String::from(
+            "SELECT event_id, device_id, user_name, timestamp, event_type, process, resource,
+                    policy_version, action, result, rule_id, prev_hash, event_hash, sequence
+             FROM audit_events WHERE 1 = 1",
+        );
+        let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = filter.since {
+            sql.push_str(" AND timestamp >= ?");
+            parameters.push(Box::new(since.to_rfc3339()));
+        }
+        if let Some(until) = filter.until {
+            sql.push_str(" AND timestamp <= ?");
+            parameters.push(Box::new(until.to_rfc3339()));
+        }
+        if let Some(event_type) = filter.event_type {
+            sql.push_str(" AND event_type = ?");
+            parameters.push(Box::new(event_type.as_str().to_string()));
+        }
+        if let Some(user) = &filter.user {
+            sql.push_str(" AND user_name = ?");
+            parameters.push(Box::new(user.clone()));
+        }
+        if let Some(device_id) = &filter.device_id {
+            sql.push_str(" AND device_id = ?");
+            parameters.push(Box::new(device_id.clone()));
+        }
+        if let Some(prefix) = &filter.resource_prefix {
+            sql.push_str(" AND resource LIKE ?");
+            parameters.push(Box::new(format!("{prefix}%")));
+        }
+        if let Some(version) = filter.policy_version {
+            sql.push_str(" AND policy_version = ?");
+            parameters.push(Box::new(version as i64));
+        }
+        sql.push_str(" AND sequence > ? ORDER BY sequence LIMIT ?");
+        parameters.push(Box::new(after_sequence.unwrap_or(0)));
+
+        let mut statement = connection.prepare(&sql)?;
+        let references: Vec<&dyn rusqlite::ToSql> =
+            parameters.iter().map(|value| value.as_ref()).collect();
+        let limit = limit.clamp(1, 200) as i64;
+        let mut query_references = references;
+        query_references.push(&limit);
+        let rows = statement.query_map(query_references.as_slice(), |row| {
+            let event = Self::audit_event_from_row(row)?;
+            let sequence = row.get::<_, i64>(13)?;
+            Ok((sequence, event))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     fn read_audit_events_in(connection: &Connection) -> Result<Vec<AuditEvent>, StoreError> {
         let mut statement = connection.prepare(
             "SELECT event_id, device_id, user_name, timestamp, event_type, process, resource,
@@ -911,6 +1002,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.last_trusted_at().unwrap(), Some(now()));
+    }
+
+    #[test]
+    fn active_policy_record_returns_import_time() {
+        let store = Store::in_memory().unwrap();
+        store
+            .import_policy(
+                &package(1),
+                ImportDecision::Accept,
+                "laptop-1",
+                "admin",
+                now(),
+            )
+            .unwrap();
+
+        let record = store.active_policy_record().unwrap().unwrap();
+
+        assert_eq!(record.package.payload.version, 1);
+        assert_eq!(record.imported_at, now());
+    }
+
+    #[test]
+    fn audit_page_respects_cursor_limit_and_filters() {
+        let store = Store::in_memory().unwrap();
+        for result in ["a", "b", "c"] {
+            let mut payload =
+                AuditPayload::new("laptop-1", "alice", EventType::ScanHit, "scan", result);
+            payload.timestamp = now();
+            store.append_audit(payload).unwrap();
+        }
+
+        let first = store
+            .query_audit_page(&EventFilter::default(), None, 2)
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let second = store
+            .query_audit_page(&EventFilter::default(), Some(first[1].0), 2)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.payload.result, "c");
     }
 
     #[test]

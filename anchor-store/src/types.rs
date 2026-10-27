@@ -2,10 +2,17 @@
 
 use std::str::FromStr;
 
-use anchor_core::EventType;
+use anchor_core::{EventType, PolicyPackage};
 use chrono::{DateTime, Utc};
 
 use crate::error::StoreError;
+
+/// 当前活动策略及其导入时间。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivePolicyRecord {
+    pub package: PolicyPackage,
+    pub imported_at: DateTime<Utc>,
+}
 
 /// 扫描状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
