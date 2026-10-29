@@ -106,6 +106,72 @@ pub struct PolicyPayload {
     pub scan: ScanRules,
 }
 
+impl PolicyPayload {
+    /// 校验策略结构和允许列表；不判断版本或到期时间。
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if (self.usb.read == ActionPolicy::Allow || self.usb.write == ActionPolicy::Allow)
+            && self.usb.allowed.is_empty()
+        {
+            return Err(invalid_policy("usb 允许读取或写入时 usb.allowed 不能为空"));
+        }
+        if self.network.policy == ActionPolicy::Allow && self.network.allowed.is_empty() {
+            return Err(invalid_policy(
+                "network.policy 为 allow 时 network.allowed 不能为空",
+            ));
+        }
+        if self.burning.policy == ActionPolicy::Allow && self.burning.allowed.is_empty() {
+            return Err(invalid_policy(
+                "burning.policy 为 allow 时 burning.allowed 不能为空",
+            ));
+        }
+
+        for (index, rule) in self.usb.allowed.iter().enumerate() {
+            let fields = [
+                ("instance_id", rule.instance_id.as_deref()),
+                ("vendor_id", rule.vendor_id.as_deref()),
+                ("product_id", rule.product_id.as_deref()),
+                ("serial", rule.serial.as_deref()),
+            ];
+            if fields.iter().all(|(_, value)| value.is_none()) {
+                return Err(invalid_policy(format!(
+                    "usb.allowed[{index}] 至少需要 instance_id、vendor_id、product_id 或 serial 之一"
+                )));
+            }
+            for (field, value) in fields {
+                if value.is_some_and(|value| value.trim().is_empty()) {
+                    return Err(invalid_policy(format!(
+                        "usb.allowed[{index}].{field} 不能为空白字符串"
+                    )));
+                }
+            }
+        }
+        for (index, rule) in self.network.allowed.iter().enumerate() {
+            if rule.adapter_id.trim().is_empty() {
+                return Err(invalid_policy(format!(
+                    "network.allowed[{index}].adapter_id 不能为空"
+                )));
+            }
+        }
+        for (index, rule) in self.burning.allowed.iter().enumerate() {
+            if rule.drive_id.trim().is_empty() {
+                return Err(invalid_policy(format!(
+                    "burning.allowed[{index}].drive_id 不能为空"
+                )));
+            }
+        }
+        for (index, file_type) in self.scan.file_types.iter().enumerate() {
+            if file_type.trim().trim_start_matches('.').is_empty() {
+                return Err(invalid_policy(format!("scan.file_types[{index}] 不能为空")));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn invalid_policy(message: impl Into<String>) -> CoreError {
+    CoreError::InvalidPolicy(message.into())
+}
+
 /// 允许的系统时间回拨容差；超出该范围即视为时间篡改并拒绝授权。
 pub const CLOCK_ROLLBACK_TOLERANCE_SECS: u64 = 300;
 
@@ -271,6 +337,24 @@ mod tests {
         let (sk, vk) = crypto::generate_keypair();
         let pkg = PolicyPackage::sign(sample_payload(1), &sk).unwrap();
         assert!(pkg.verify_signature(&vk));
+    }
+
+    #[test]
+    fn policy_validation_rejects_allow_lists_without_targets() {
+        let mut payload = sample_payload(1);
+        payload.usb.read = ActionPolicy::Allow;
+        assert!(payload.validate().is_err());
+
+        payload.usb.read = ActionPolicy::Deny;
+        payload.network.policy = ActionPolicy::Allow;
+        assert!(payload.validate().is_err());
+
+        payload.network.policy = ActionPolicy::Deny;
+        payload.burning.policy = ActionPolicy::Allow;
+        assert!(payload.validate().is_err());
+
+        payload.burning.policy = ActionPolicy::Deny;
+        assert!(payload.validate().is_ok());
     }
 
     #[test]

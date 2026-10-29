@@ -191,6 +191,34 @@ pub struct PolicyEnvelope {
     pub server_key_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerKeyStatus {
+    Active,
+    Retired,
+}
+
+impl ServerKeyStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerKey {
+    pub key_id: String,
+    pub public_key_hex: String,
+    pub status: ServerKeyStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerKeyringResponse {
+    pub keys: Vec<ServerKey>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareInventory {
     pub schema_version: u32,
@@ -416,6 +444,21 @@ mod tests {
         let encoded = serde_json::to_string(&envelope).unwrap();
         let decoded: PolicyEnvelope = serde_json::from_str(&encoded).unwrap();
         assert_eq!(envelope, decoded);
+    }
+
+    #[test]
+    fn keyring_round_trips() {
+        let keyring = ServerKeyringResponse {
+            keys: vec![ServerKey {
+                key_id: "a".repeat(64),
+                public_key_hex: "b".repeat(64),
+                status: ServerKeyStatus::Active,
+            }],
+        };
+        let encoded = serde_json::to_string(&keyring).unwrap();
+        let decoded: ServerKeyringResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, keyring);
+        assert!(encoded.contains("\"status\":\"active\""));
     }
 
     #[test]
