@@ -42,21 +42,107 @@ impl DeviceStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiErrorCode {
     InvalidRequest,
     ProtocolVersionUnsupported,
     Unauthorized,
+    InvalidCredentials,
+    CsrfInvalid,
+    SetupUnavailable,
+    SetupComplete,
+    SetupTokenInvalid,
     DevicePending,
     DeviceRejected,
     DeviceDisabled,
+    DeviceNotFound,
+    AlreadyActive,
+    InvalidDeviceState,
+    InventoryChanged,
     TokenInvalid,
     PolicyNotFound,
     PolicyNotSigned,
     VersionConflict,
     RateLimited,
+    PayloadTooLarge,
+    UnsupportedMediaType,
     Internal,
+    Unknown(String),
+}
+
+impl ApiErrorCode {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::ProtocolVersionUnsupported => "protocol_version_unsupported",
+            Self::Unauthorized => "unauthorized",
+            Self::InvalidCredentials => "invalid_credentials",
+            Self::CsrfInvalid => "csrf_invalid",
+            Self::SetupUnavailable => "setup_unavailable",
+            Self::SetupComplete => "setup_complete",
+            Self::SetupTokenInvalid => "setup_token_invalid",
+            Self::DevicePending => "device_pending",
+            Self::DeviceRejected => "device_rejected",
+            Self::DeviceDisabled => "device_disabled",
+            Self::DeviceNotFound => "device_not_found",
+            Self::AlreadyActive => "already_active",
+            Self::InvalidDeviceState => "invalid_device_state",
+            Self::InventoryChanged => "inventory_changed",
+            Self::TokenInvalid => "token_invalid",
+            Self::PolicyNotFound => "policy_not_found",
+            Self::PolicyNotSigned => "policy_not_signed",
+            Self::VersionConflict => "version_conflict",
+            Self::RateLimited => "rate_limited",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::Internal => "internal",
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+impl Serialize for ApiErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "invalid_request" => Self::InvalidRequest,
+            "protocol_version_unsupported" => Self::ProtocolVersionUnsupported,
+            "unauthorized" => Self::Unauthorized,
+            "invalid_credentials" => Self::InvalidCredentials,
+            "csrf_invalid" => Self::CsrfInvalid,
+            "setup_unavailable" => Self::SetupUnavailable,
+            "setup_complete" => Self::SetupComplete,
+            "setup_token_invalid" => Self::SetupTokenInvalid,
+            "device_pending" => Self::DevicePending,
+            "device_rejected" => Self::DeviceRejected,
+            "device_disabled" => Self::DeviceDisabled,
+            "device_not_found" => Self::DeviceNotFound,
+            "already_active" => Self::AlreadyActive,
+            "invalid_device_state" => Self::InvalidDeviceState,
+            "inventory_changed" => Self::InventoryChanged,
+            "token_invalid" => Self::TokenInvalid,
+            "policy_not_found" => Self::PolicyNotFound,
+            "policy_not_signed" => Self::PolicyNotSigned,
+            "version_conflict" => Self::VersionConflict,
+            "rate_limited" => Self::RateLimited,
+            "payload_too_large" => Self::PayloadTooLarge,
+            "unsupported_media_type" => Self::UnsupportedMediaType,
+            "internal" => Self::Internal,
+            _ => Self::Unknown(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +427,17 @@ mod tests {
         };
         let value = serde_json::to_value(error).unwrap();
         assert_eq!(value["code"], "device_pending");
+    }
+
+    #[test]
+    fn unknown_error_codes_are_preserved() {
+        let error: ApiError = serde_json::from_value(serde_json::json!({
+            "code": "future_error",
+            "message": "new server error"
+        }))
+        .unwrap();
+        assert_eq!(error.code, ApiErrorCode::Unknown("future_error".into()));
+        assert_eq!(serde_json::to_value(error).unwrap()["code"], "future_error");
     }
 
     #[test]
