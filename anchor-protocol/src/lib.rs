@@ -228,6 +228,10 @@ pub struct UsbDeviceInventory {
     #[serde(default)]
     pub instance_id: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub manufacturer: String,
+    #[serde(default)]
     pub vendor_id: String,
     #[serde(default)]
     pub product_id: String,
