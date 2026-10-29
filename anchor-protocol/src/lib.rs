@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// 当前服务端与客户端之间的协议版本。
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// 当前硬件清单结构版本。
+pub const HARDWARE_INVENTORY_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceStatus {
@@ -16,6 +19,27 @@ pub enum DeviceStatus {
     Active,
     Rejected,
     Disabled,
+}
+
+impl DeviceStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Rejected => "rejected",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "active" => Some(Self::Active),
+            "rejected" => Some(Self::Rejected),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,5 +342,19 @@ mod tests {
     #[test]
     fn protocol_version_is_one() {
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn device_status_has_a_stable_wire_mapping() {
+        for status in [
+            DeviceStatus::Pending,
+            DeviceStatus::Active,
+            DeviceStatus::Rejected,
+            DeviceStatus::Disabled,
+        ] {
+            assert_eq!(DeviceStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(DeviceStatus::parse("enabled"), None);
+        assert_eq!(HARDWARE_INVENTORY_SCHEMA_VERSION, 1);
     }
 }
