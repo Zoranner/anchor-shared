@@ -1,0 +1,11 @@
+[package]
+name = "anchor-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anchor Guard 服务端与客户端共享协议"
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
