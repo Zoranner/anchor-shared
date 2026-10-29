@@ -180,6 +180,8 @@ pub struct DeviceStatusResponse {
 pub struct HeartbeatRequest {
     pub client_version: String,
     pub inventory_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<HardwareInventory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
