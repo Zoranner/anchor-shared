@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="240" viewBox="0 0 360 240">
+  <defs>
+    <linearGradient id="screen" x1="0" y1="0" x2="360" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1A120B"/>
+      <stop offset="1" stop-color="#0B0806"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="12" y1="8" x2="84" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB020"/>
+      <stop offset="1" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="48" y1="18" x2="48" y2="80" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFF0DE"/>
+    </linearGradient>
+  </defs>
+  <rect width="360" height="240" fill="url(#screen)"/>
+  <circle cx="180" cy="70" r="120" fill="#FF9F1C" opacity="0.10"/>
+  <g transform="translate(132 24)">
+    <rect width="96" height="96" fill="url(#badge)"/>
+    <rect x="3" y="3" width="90" height="90" fill="none" stroke="#FFE0B2" stroke-opacity="0.45" stroke-width="1.5"/>
+    <path d="M48 17 71 26v19c0 14.5-10 25.5-23 34-13-8.5-23-19.5-23-34V26l23-9Z"
+          fill="url(#shield)" stroke="#FFE0B2" stroke-opacity="0.9" stroke-width="1.5" stroke-linejoin="round"/>
+    <path d="M48 31v20" stroke="#EA580C" stroke-width="6" stroke-linecap="round"/>
+    <path d="m39.5 44.5 8.5 8.5 8.5-8.5" fill="none" stroke="#EA580C" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M37 63h22" stroke="#EA580C" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <text x="180" y="152" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif"
+        font-size="20" font-weight="600" fill="#FFFFFF">Anchor Guard</text>
+  <text x="180" y="176" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif"
+        font-size="12" fill="#D8C7B5">等待导入策略</text>
+  <rect x="129" y="194" width="102" height="28" rx="14" fill="#EA580C" opacity="0.18"
+        stroke="#FFB020" stroke-opacity="0.55"/>
+  <text x="180" y="213" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif"
+        font-size="12" font-weight="600" fill="#FFC46B">导入策略</text>
+</svg>
