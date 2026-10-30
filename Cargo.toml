@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "anchor-core",
+    "anchor-protocol",
+]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2021"
+license = "Proprietary"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
